@@ -1,0 +1,11 @@
+pandas
+numpy
+scikit-learn
+xgboost
+streamlit
+python-dotenv
+SQLAlchemy
+psycopg2-binary
+openpyxl
+joblib
+requests
