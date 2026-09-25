@@ -1,11 +1,11 @@
+streamlit
 pandas
 numpy
+sqlalchemy
+psycopg[binary]
+python-dotenv
+plotly
 scikit-learn
 xgboost
-streamlit
-python-dotenv
-SQLAlchemy
-psycopg2-binary
-openpyxl
-joblib
+pyyaml
 requests
