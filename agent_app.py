@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -493,6 +494,85 @@ def forecast_is_stale(df):
 
 
 # ============================================================
+# ACTUAL GENERATION + HISTORICAL BACKTEST HELPERS
+# ============================================================
+
+def load_actual_generation(site):
+    """Load actual daily generation and rainfall from the model-ready dataset."""
+    path = BASE_DIR / "data" / "HydroGen_Model_Ready_Dataset.csv"
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+    required = {"Site", "Date", "Generation_kWh"}
+    if not required.issubset(df.columns):
+        return pd.DataFrame()
+    df["Site"] = df["Site"].astype(str).str.upper().str.strip()
+    df = df[df["Site"] == str(site).upper()].copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Generation_kWh"] = pd.to_numeric(df["Generation_kWh"], errors="coerce")
+    if "Rainfall_Input_mm" in df.columns:
+        df["Rainfall_Input_mm"] = pd.to_numeric(df["Rainfall_Input_mm"], errors="coerce")
+    else:
+        df["Rainfall_Input_mm"] = float("nan")
+    return (
+        df.dropna(subset=["Date", "Generation_kWh"])
+        .sort_values("Date")
+        .drop_duplicates("Date", keep="last")
+        [["Site", "Date", "Generation_kWh", "Rainfall_Input_mm"]]
+        .rename(columns={
+            "Generation_kWh": "Actual_Generation_kWh",
+            "Rainfall_Input_mm": "Actual_Rainfall_mm",
+        })
+        .reset_index(drop=True)
+    )
+
+
+def load_historical_backtest(site):
+    path = BASE_DIR / "outputs" / "historical_backtest.csv"
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+    if "Site" not in df.columns or "Date" not in df.columns:
+        return pd.DataFrame()
+    df["Site"] = df["Site"].astype(str).str.upper().str.strip()
+    df = df[df["Site"] == str(site).upper()].copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    for col in [
+        "Actual_Generation_kWh", "Backtest_Forecast_Generation_kWh",
+        "Generation_Difference_kWh", "Absolute_Error_kWh",
+        "Absolute_Percentage_Error", "Actual_Rainfall_mm",
+        "Backtest_Rainfall_Input_mm",
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+
+
+def error_summary(actual, predicted):
+    pair = pd.DataFrame({"actual": actual, "predicted": predicted})
+    pair["actual"] = pd.to_numeric(pair["actual"], errors="coerce")
+    pair["predicted"] = pd.to_numeric(pair["predicted"], errors="coerce")
+    pair = pair.dropna()
+    if pair.empty:
+        return None
+    error = pair["predicted"] - pair["actual"]
+    nonzero = pair["actual"].abs() > 0
+    return {
+        "MAE": float(error.abs().mean()),
+        "RMSE": float(np.sqrt(np.mean(np.square(error)))),
+        "MAPE": float((error[nonzero].abs() / pair.loc[nonzero, "actual"].abs()).mean() * 100)
+        if nonzero.any() else float("nan"),
+        "count": int(len(pair)),
+    }
+
+
+# ============================================================
 # FORECAST FILTERS
 # ============================================================
 
@@ -848,11 +928,12 @@ else:
         # All tabs use the SAME filtered dataframe.
         # ========================================================
 
-        tab1, tab2, tab3 = st.tabs(
+        tab1, tab2, tab3, tab4 = st.tabs(
             [
                 "🌧️ Upcoming Days",
                 "📅 Next 12 Months",
                 "📊 Monthly Outlook",
+                "🎯 Actual vs Forecast",
             ]
         )
 
@@ -1051,6 +1132,160 @@ else:
                 use_container_width=True,
                 hide_index=True,
             )
+
+        # ========================================================
+        # TAB 4 — ACTUAL VS FORECAST + HISTORICAL TRENDS
+        # ========================================================
+
+        with tab4:
+            st.header("🎯 Actual vs Forecast Generation")
+            st.caption(
+                "Historical one-day-ahead backtest and actual observations. "
+                "Future dates are compared only after actual data is recorded."
+            )
+
+            actuals = load_actual_generation(site)
+            backtest = load_historical_backtest(site)
+
+            # Merge latest actual observations with saved forecasts for any dates
+            # where an actual value has since become available.
+            future_comparison = long_forecast.merge(
+                actuals[["Date", "Actual_Generation_kWh", "Actual_Rainfall_mm"]],
+                on="Date",
+                how="left",
+            ) if not long_forecast.empty and not actuals.empty else pd.DataFrame()
+
+            if not future_comparison.empty:
+                future_comparison = future_comparison.dropna(
+                    subset=["Actual_Generation_kWh"]
+                ).copy()
+                if not future_comparison.empty:
+                    future_comparison["Generation_Difference_kWh"] = (
+                        future_comparison["Forecast_Generation_kWh"]
+                        - future_comparison["Actual_Generation_kWh"]
+                    )
+                    future_comparison["Absolute_Error_kWh"] = (
+                        future_comparison["Generation_Difference_kWh"].abs()
+                    )
+                    future_comparison["Absolute_Percentage_Error"] = np.where(
+                        future_comparison["Actual_Generation_kWh"].abs() > 0,
+                        future_comparison["Absolute_Error_kWh"]
+                        / future_comparison["Actual_Generation_kWh"].abs() * 100,
+                        np.nan,
+                    )
+
+            if not backtest.empty:
+                metrics = error_summary(
+                    backtest["Actual_Generation_kWh"],
+                    backtest["Backtest_Forecast_Generation_kWh"],
+                )
+                if metrics:
+                    m1, m2, m3, m4 = st.columns(4)
+                    with m1:
+                        kpi_card("Backtest MAE", f"{metrics['MAE']:,.0f} kWh")
+                    with m2:
+                        kpi_card("Backtest RMSE", f"{metrics['RMSE']:,.0f} kWh")
+                    with m3:
+                        kpi_card(
+                            "Backtest MAPE",
+                            f"{metrics['MAPE']:.2f}%" if np.isfinite(metrics["MAPE"]) else "N/A",
+                        )
+                    with m4:
+                        kpi_card("Compared Days", f"{metrics['count']:,}")
+
+                st.subheader("Daily Historical Generation: Actual vs Backtest")
+                bt_chart = backtest[
+                    ["Date", "Actual_Generation_kWh", "Backtest_Forecast_Generation_kWh"]
+                ].dropna().sort_values("Date").set_index("Date")
+                st.line_chart(bt_chart, height=360)
+
+                st.subheader("Daily Historical Rainfall")
+                rain_cols = [
+                    c for c in ["Actual_Rainfall_mm", "Backtest_Rainfall_Input_mm"]
+                    if c in backtest.columns
+                ]
+                if rain_cols:
+                    rain_chart = backtest[["Date"] + rain_cols].dropna(
+                        subset=["Date"]
+                    ).sort_values("Date").set_index("Date")
+                    st.line_chart(rain_chart, height=280)
+
+                monthly_bt = backtest.copy()
+                monthly_bt["Year"] = monthly_bt["Date"].dt.year
+                monthly_bt["Month_Number"] = monthly_bt["Date"].dt.month
+                monthly_bt["Month"] = monthly_bt["Date"].dt.strftime("%b")
+                monthly_bt = monthly_bt.groupby(
+                    ["Year", "Month_Number", "Month"], as_index=False
+                ).agg(
+                    Actual_Generation_kWh=("Actual_Generation_kWh", "sum"),
+                    Backtest_Forecast_Generation_kWh=("Backtest_Forecast_Generation_kWh", "sum"),
+                    Actual_Rainfall_mm=("Actual_Rainfall_mm", "sum"),
+                    MAE_kWh=("Absolute_Error_kWh", "mean"),
+                    MAPE_Percent=("Absolute_Percentage_Error", "mean"),
+                ).sort_values(["Year", "Month_Number"])
+                monthly_bt["Year_Month"] = (
+                    monthly_bt["Year"].astype(str) + "-" + monthly_bt["Month"]
+                )
+
+                st.subheader("Monthly Actual vs Backtest Generation")
+                st.bar_chart(
+                    monthly_bt.set_index("Year_Month")[
+                        ["Actual_Generation_kWh", "Backtest_Forecast_Generation_kWh"]
+                    ],
+                    height=360,
+                )
+                st.subheader("Monthly Generation and Error Details")
+                st.dataframe(monthly_bt, use_container_width=True, hide_index=True)
+
+                st.subheader("Daily Backtest Error Details")
+                daily_bt = backtest.copy()
+                daily_bt["Date"] = daily_bt["Date"].dt.date
+                st.dataframe(
+                    daily_bt.sort_values("Date", ascending=False),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.download_button(
+                    "📥 Download Historical Comparison",
+                    data=backtest.to_csv(index=False),
+                    file_name=f"{site}_historical_actual_vs_forecast.csv",
+                    mime="text/csv",
+                    key=f"{site}_download_backtest",
+                )
+            else:
+                st.info(
+                    "Historical backtest data is not available yet. Click "
+                    "**Refresh 365-Day Forecast** to run forecast.py, which also "
+                    "generates outputs/historical_backtest.csv. Ensure the site's "
+                    "model and feature files are present."
+                )
+
+            if not future_comparison.empty:
+                st.subheader("Actuals Recorded for Previously Forecast Dates")
+                st.caption(
+                    "This table appears only for forecast dates that now have actual generation."
+                )
+                fc_display = future_comparison.copy()
+                fc_display["Date"] = fc_display["Date"].dt.date
+                st.dataframe(
+                    fc_display.sort_values("Date", ascending=False),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            elif not actuals.empty:
+                st.info(
+                    "Actual generation is available in the dataset, but none of its dates "
+                    "overlap with the currently stored 365-day forecast. Historical "
+                    "backtest results above provide the available comparison."
+                )
+
+            if actuals.empty:
+                st.warning(
+                    "No actual generation data could be loaded. Check that "
+                    "data/HydroGen_Model_Ready_Dataset.csv contains Site, Date, "
+                    "Generation_kWh and (ideally) Rainfall_Input_mm."
+                )
+
 
 # ============================================================
 # FOOTER
