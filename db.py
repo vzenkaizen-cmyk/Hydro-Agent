@@ -269,6 +269,29 @@ class GenerationForecast(Base):
 
 
 # ============================================================
+# ACTUAL GENERATION TABLE
+# ============================================================
+
+class ActualGeneration(Base):
+    """Observed daily plant generation and rainfall, when imported."""
+    __tablename__ = "actual_generation"
+
+    id = Column(Integer, primary_key=True)
+    site_code = Column(String(20), nullable=False)
+    actual_date = Column(Date, nullable=False)
+    generation_kwh = Column(Float, nullable=False)
+    rainfall_mm = Column(Float)
+    source = Column(String(100))
+    imported_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "site_code", "actual_date", name="uq_actual_generation_site_date"
+        ),
+    )
+
+
+# ============================================================
 # DATABASE AVAILABILITY
 # ============================================================
 
@@ -830,3 +853,109 @@ def database_status():
         )
 
         return "Connection failed"
+
+
+# ============================================================
+# ACTUAL GENERATION IMPORT / RETRIEVAL
+# ============================================================
+
+def upsert_actual_generation(actual_df, site=None, source="HydroGen_Model_Ready_Dataset.csv"):
+    """
+    Import actual observations into PostgreSQL.
+
+    Expected columns: Site, Date, Generation_kWh; optional Rainfall_Input_mm.
+    Duplicate site/date rows are updated safely.
+    """
+    if engine is None or actual_df is None:
+        return False
+
+    df = pd.DataFrame(actual_df).copy()
+    if df.empty:
+        return False
+    df.columns = [str(c).strip() for c in df.columns]
+
+    required = {"Date", "Generation_kWh"}
+    if not required.issubset(df.columns):
+        return False
+    if "Site" not in df.columns:
+        if not site:
+            return False
+        df["Site"] = site
+
+    now = datetime.now(timezone.utc)
+    rows = []
+    for _, row in df.iterrows():
+        dt = pd.to_datetime(row.get("Date"), errors="coerce")
+        generation = pd.to_numeric(row.get("Generation_kWh"), errors="coerce")
+        if pd.isna(dt) or pd.isna(generation):
+            continue
+        code = str(site or row.get("Site", "")).upper().strip()
+        if not code:
+            continue
+        rain = pd.to_numeric(row.get("Rainfall_Input_mm"), errors="coerce")
+        rows.append({
+            "site_code": code,
+            "actual_date": dt.date(),
+            "generation_kwh": float(generation),
+            "rainfall_mm": float(rain) if pd.notna(rain) else None,
+            "source": source,
+            "imported_at": now,
+        })
+
+    # De-duplicate within the import batch before the database upsert.
+    unique_rows = {}
+    for row in rows:
+        unique_rows[(row["site_code"], row["actual_date"])] = row
+    rows = list(unique_rows.values())
+    if not rows:
+        return False
+
+    stmt = insert(ActualGeneration).values(rows)
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_actual_generation_site_date",
+        set_={
+            "generation_kwh": stmt.excluded.generation_kwh,
+            "rainfall_mm": stmt.excluded.rainfall_mm,
+            "source": stmt.excluded.source,
+            "imported_at": stmt.excluded.imported_at,
+        },
+    )
+    with Session(engine) as session:
+        try:
+            session.execute(stmt)
+            session.commit()
+            return True
+        except Exception:
+            session.rollback()
+            raise
+
+
+def load_actual_generation(site, start_date=None, end_date=None):
+    """Return imported actual generation for one site as a dataframe."""
+    if engine is None:
+        return pd.DataFrame()
+
+    query = select(ActualGeneration).where(
+        ActualGeneration.site_code == str(site).upper().strip()
+    )
+    if start_date is not None:
+        query = query.where(ActualGeneration.actual_date >= pd.to_datetime(start_date).date())
+    if end_date is not None:
+        query = query.where(ActualGeneration.actual_date <= pd.to_datetime(end_date).date())
+
+    with Session(engine) as session:
+        rows = session.scalars(
+            query.order_by(ActualGeneration.actual_date.asc())
+        ).all()
+
+    return pd.DataFrame([
+        {
+            "Site": row.site_code,
+            "Date": row.actual_date,
+            "Generation_kWh": row.generation_kwh,
+            "Rainfall_Input_mm": row.rainfall_mm,
+            "Actual_Source": row.source,
+            "Imported_At": row.imported_at,
+        }
+        for row in rows
+    ])
