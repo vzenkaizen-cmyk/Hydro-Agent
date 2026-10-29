@@ -30,7 +30,12 @@ st.markdown(
     """
     <style>
         .block-container {
-            padding-top: 0.5rem !important;
+            padding-top: 1rem !important;
+        }
+        .block-container h1 {
+            line-height: 1.3 !important;
+            padding-top: 0.1rem !important;
+            overflow: visible !important;
         }
         .hydro-hero {
             margin-top: 0 !important;
