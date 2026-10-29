@@ -25,6 +25,22 @@ st.set_page_config(
     layout="wide",
 )
 
+# Remove excess whitespace above the Hydro Agent page content.
+st.markdown(
+    """
+    <style>
+        .block-container {
+            padding-top: 0.5rem !important;
+        }
+        .hydro-hero {
+            margin-top: 0 !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
