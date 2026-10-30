@@ -1,1319 +1,552 @@
-import os
-import sys
-import subprocess
+from __future__ import annotations
+
 from pathlib import Path
+from datetime import date, timedelta
 
-import pandas as pd
+import joblib
 import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
-from dotenv import load_dotenv
-
-from agent.plant_locations import PLANTS
-from agent.weather_tool import get_weather_forecast
-from agent.generation_tool import run_hydro_forecast
-
-import db
 
 
 # ============================================================
-# PAGE CONFIG
+# PAGE CONFIGURATION
 # ============================================================
-
 st.set_page_config(
     page_title="Hydro Intelligence Agent",
     page_icon="💧",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# Remove excess whitespace above the Hydro Agent page content.
+BASE_DIR = Path(__file__).resolve().parent
+DATA_PATH = BASE_DIR / "data" / "HydroGen_Model_Ready_Dataset.csv"
+MODEL_DIR = BASE_DIR / "models"
+OUTPUT_DIR = BASE_DIR / "outputs"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+FEATURES = [
+    "Rainfall_Input_mm",
+    "Lag1_Generation_kWh", "Lag7_Generation_kWh",
+    "Lag14_Generation_kWh", "Lag30_Generation_kWh",
+    "Rolling7_Generation_kWh", "Rolling30_Generation_kWh",
+    "Lag1_Rainfall_mm", "Lag7_Rainfall_mm",
+    "Lag14_Rainfall_mm", "Lag30_Rainfall_mm",
+    "Rolling7_Rainfall_mm", "Rolling30_Rainfall_mm",
+    "Month", "DayOfYear", "WeekOfYear",
+    "Sin_DayOfYear", "Cos_DayOfYear",
+    "Rainfall_Coverage_30D",
+]
+
+
+# ============================================================
+# CLEAN, CONSISTENT PAGE STYLING
+# ============================================================
 st.markdown(
     """
     <style>
-        .block-container {
-            padding-top: 1rem !important;
-        }
-        .block-container h1 {
-            line-height: 1.3 !important;
-            padding-top: 0.1rem !important;
-            overflow: visible !important;
-        }
-        .hydro-hero {
-            margin-top: 0 !important;
-        }
+    /* Prevent the title and first line from being hidden under Streamlit chrome. */
+    .block-container {
+        padding-top: 2.25rem !important;
+        padding-bottom: 2.5rem !important;
+        max-width: 1500px;
+    }
+    [data-testid="stHeader"] {
+        height: 2.8rem;
+        background: rgba(255,255,255,0.96);
+    }
+    [data-testid="stToolbar"] { right: 1rem; }
+    h1, h2, h3, h4, p, label, [data-testid="stMetricLabel"] {
+        overflow: visible !important;
+        line-height: 1.35 !important;
+    }
+    h1 {
+        padding-top: .15rem !important;
+        margin-top: .15rem !important;
+        margin-bottom: .35rem !important;
+        font-weight: 750 !important;
+        letter-spacing: -.025em;
+    }
+    h2 { margin-top: 1.3rem !important; }
+    h3 { margin-top: .7rem !important; }
+    [data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 15px 17px;
+        min-height: 112px;
+    }
+    [data-testid="stMetricLabel"] p {
+        white-space: normal !important;
+        font-size: .9rem !important;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 1.65rem !important;
+        line-height: 1.3 !important;
+    }
+    div[data-testid="stDataFrame"] {
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+    }
+    .hero {
+        background: linear-gradient(110deg, #092b4c 0%, #124c78 100%);
+        color: white;
+        border-radius: 14px;
+        padding: 22px 26px;
+        margin: 1rem 0 1.5rem 0;
+        box-shadow: 0 5px 18px rgba(12, 42, 70, .12);
+    }
+    .hero-kicker {
+        font-size: .72rem;
+        letter-spacing: .12em;
+        text-transform: uppercase;
+        font-weight: 700;
+        color: #9bd8ff;
+        margin-bottom: 7px;
+    }
+    .hero-title {
+        font-size: 1.45rem;
+        line-height: 1.35;
+        font-weight: 750;
+        margin: 0;
+    }
+    .subtle { color: #64748b; font-size: .9rem; }
+    .section-note { color: #64748b; font-size: .88rem; margin-top: -.35rem; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
-
-
 # ============================================================
-# ENVIRONMENT
+# DATA AND MODEL LOADING
 # ============================================================
-
-def get_secret(name):
-    value = os.getenv(name)
-
-    if value:
-        return str(value).strip()
-
-    try:
-        value = st.secrets.get(name)
-        if value:
-            return str(value).strip()
-    except Exception:
-        pass
-
-    return None
-
-
-OPENWEATHER_API_KEY = get_secret("OPENWEATHER_API_KEY")
-
-if OPENWEATHER_API_KEY:
-    os.environ["OPENWEATHER_API_KEY"] = OPENWEATHER_API_KEY
-
-
-# ============================================================
-# DATABASE
-# ============================================================
-
-if db.db_available():
-    try:
-        db.init_db(PLANTS)
-        DB_STATUS = db.database_status()
-    except Exception:
-        DB_STATUS = "Connection failed"
-else:
-    DB_STATUS = "Not configured"
-
-
-
-# ============================================================
-# LANDING PAGE / HERO
-# ============================================================
-
-if "hydro_agent_started" not in st.session_state:
-    st.session_state["hydro_agent_started"] = False
-
-if "short_forecast" not in st.session_state:
-    st.session_state["short_forecast"] = pd.DataFrame()
-
-if "long_forecast" not in st.session_state:
-    st.session_state["long_forecast"] = pd.DataFrame()
-
-if "forecast_site" not in st.session_state:
-    st.session_state["forecast_site"] = None
-
-
-def show_hydro_hero():
-    """Professional dark opening screen. Uses HTML intentionally."""
-    st.markdown(
-        """
-        <style>
-        .hydro-hero {
-            margin: 0.5rem 0 1.5rem 0;
-            padding: 58px 64px 48px 64px;
-            border-radius: 24px;
-            background:
-                radial-gradient(circle at 82% 18%, rgba(44, 158, 255, .24), transparent 28%),
-                radial-gradient(circle at 12% 88%, rgba(0, 92, 190, .18), transparent 30%),
-                linear-gradient(135deg, #061426 0%, #08213b 52%, #0a3157 100%);
-            color: #ffffff;
-            box-shadow: 0 18px 50px rgba(3, 20, 40, .20);
-        }
-        .hydro-icon {
-            width: 68px;
-            height: 68px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            border-radius: 18px;
-            background: linear-gradient(135deg, #1688ff, #2357e8);
-            box-shadow: 0 10px 30px rgba(22, 136, 255, .35);
-            font-size: 34px;
-            margin-bottom: 22px;
-        }
-        .hydro-eyebrow {
-            display: inline-block;
-            padding: 6px 12px;
-            margin-bottom: 15px;
-            border: 1px solid rgba(126, 203, 255, .25);
-            border-radius: 999px;
-            background: rgba(80, 170, 255, .08);
-            color: #a9dcff;
-            font-size: 11px;
-            font-weight: 700;
-            letter-spacing: 1.1px;
-        }
-        .hydro-title {
-            margin: 0;
-            font-size: clamp(34px, 4.5vw, 56px);
-            line-height: 1.06;
-            font-weight: 800;
-            letter-spacing: -1.5px;
-        }
-        .hydro-title span { color: #58b6ff; }
-        .hydro-subtitle {
-            max-width: 820px;
-            margin: 18px 0 0 0;
-            color: #c1d3e7;
-            font-size: 16px;
-            line-height: 1.65;
-        }
-        .hydro-badges {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 9px;
-            margin-top: 25px;
-        }
-        .hydro-badge {
-            padding: 8px 12px;
-            border-radius: 10px;
-            border: 1px solid rgba(150, 210, 255, .14);
-            background: rgba(255,255,255,.055);
-            color: #d8eaff;
-            font-size: 12px;
-        }
-        .hydro-bottom {
-            margin-top: 27px;
-            color: #8aaaca;
-            font-size: 12px;
-        }
-        </style>
-
-        <div class="hydro-hero">
-            <div class="hydro-icon">💧</div>
-            <div class="hydro-eyebrow">
-                AI POWERED • HYDRO INTELLIGENCE • DATA-DRIVEN FORECASTING
-            </div>
-            <h1 class="hydro-title">
-                Hydro <span>Intelligence</span> Agent
-            </h1>
-            <p class="hydro-subtitle">
-                An intelligent forecasting workspace combining real-time
-                weather intelligence, XGBoost generation forecasting and
-                PostgreSQL analytics to turn hydropower data into
-                actionable plant-level insights.
-            </p>
-            <div class="hydro-badges">
-                <div class="hydro-badge">🌧️ OpenWeather Intelligence</div>
-                <div class="hydro-badge">⚡ XGBoost Forecasting</div>
-                <div class="hydro-badge">📊 365-Day Outlook</div>
-                <div class="hydro-badge">🗄️ PostgreSQL Analytics</div>
-                <div class="hydro-badge">🏭 Multi-Plant Support</div>
-            </div>
-            <div class="hydro-bottom">
-                Forecast • Analyse • Discover
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def show_started_header():
-    st.markdown(
-        """
-        <div style="
-            padding: 12px 18px;
-            margin-bottom: 18px;
-            border-radius: 14px;
-            background: linear-gradient(90deg, #061426, #0b3157);
-            color: white;
-            box-shadow: 0 5px 20px rgba(5,30,55,.10);
-        ">
-            <div style="
-                font-size: 11px;
-                letter-spacing: 1px;
-                color: #8fd0ff;
-                font-weight: 700;
-                text-transform: uppercase;
-            ">
-                Hydro Intelligence Agent
-            </div>
-            <div style="
-                font-size: 22px;
-                font-weight: 750;
-                margin-top: 3px;
-            ">
-                Forecast with confidence. Plan with intelligence.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# Always show the opening screen first.
-if not st.session_state["hydro_agent_started"]:
-    show_hydro_hero()
-    _, hero_button_col, _ = st.columns([1.5, 1, 1.5])
-    with hero_button_col:
-        if st.button(
-            "🚀  Get Started",
-            type="primary",
-            use_container_width=True,
-            key="hero_get_started",
-        ):
-            st.session_state["hydro_agent_started"] = True
-            st.rerun()
-
-    st.markdown(
-        """
-        <div style="
-            text-align:center;
-            color:#64748b;
-            font-size:12px;
-            margin-top:10px;
-            margin-bottom:30px;
-        ">
-            Weather intelligence → Generation prediction → 365-day planning
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.stop()
-
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def kpi_card(title, value):
-    """
-    Custom KPI card.
-    Uses nowrap + visible overflow so large numbers are not
-    displayed as '...' inside narrow Streamlit metric cards.
-    """
-    st.markdown(
-        f"""
-        <div style="
-            border:1px solid #E5E7EB;
-            border-radius:12px;
-            padding:16px 18px;
-            min-height:105px;
-            background:#FFFFFF;
-            box-shadow:0 1px 3px rgba(0,0,0,0.06);
-        ">
-            <div style="
-                font-size:14px;
-                color:#6B7280;
-                margin-bottom:8px;
-                white-space:nowrap;
-            ">
-                {title}
-            </div>
-            <div style="
-                font-size:25px;
-                font-weight:650;
-                color:#111827;
-                white-space:nowrap;
-                overflow:visible;
-                line-height:1.2;
-            ">
-                {value}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def clean_forecast_dataframe(df, site=None):
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    if "Date" not in df.columns:
-        return pd.DataFrame()
-
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df = df.dropna(subset=["Date"]).copy()
-
-    if "Forecast_Generation_kWh" not in df.columns:
-        return pd.DataFrame()
-
-    df["Forecast_Generation_kWh"] = pd.to_numeric(
-        df["Forecast_Generation_kWh"],
-        errors="coerce",
-    )
-    df = df.dropna(subset=["Forecast_Generation_kWh"]).copy()
-
-    if "Forecast_Rainfall_mm" in df.columns:
-        df["Forecast_Rainfall_mm"] = pd.to_numeric(
-            df["Forecast_Rainfall_mm"],
-            errors="coerce",
-        )
-
-    if site:
-        df["Site"] = site
-
-    return df.sort_values("Date").reset_index(drop=True)
-
-
-def load_csv_long_term(site):
-    path = BASE_DIR / "outputs" / "next_year_forecast.csv"
-
-    if not path.exists():
-        return pd.DataFrame()
-
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        return pd.DataFrame()
-
-    df.columns = df.columns.str.strip()
-
-    site_column = next(
-        (
-            c
-            for c in ["Site", "site", "SITE", "Plant", "plant"]
-            if c in df.columns
-        ),
-        None,
-    )
-
-    if site_column:
-        if site_column != "Site":
-            df = df.rename(columns={site_column: "Site"})
-
-        df = df[
-            df["Site"].astype(str).str.upper() == site.upper()
-        ].copy()
-    elif {
-        "Date",
-        "Forecast_Generation_kWh",
-    }.issubset(df.columns):
-        # Single-plant CSV.
-        df["Site"] = site
-    else:
-        return pd.DataFrame()
-
-    return clean_forecast_dataframe(df, site)
-
-
-
-def run_long_term_forecast(site):
-    """
-    Regenerate the rolling 365-day forecast for the selected plant.
-
-    forecast.py must accept the plant/site code as its first command-line
-    argument. Running it with the selected site prevents an unrelated plant
-    from blocking the current dashboard.
-    """
-    forecast_script = BASE_DIR / "forecast.py"
-
-    if not forecast_script.exists():
-        raise FileNotFoundError(
-            f"forecast.py was not found in the project folder: {forecast_script}"
-        )
-
-    result = subprocess.run(
-        [sys.executable, str(forecast_script), str(site)],
-        cwd=str(BASE_DIR),
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
-
-    if result.returncode != 0:
-        details = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(
-            "forecast.py failed for "
-            f"{site}.\n\n{details[-5000:]}"
-        )
-
-    return result.stdout
-
-
-def save_long_term_to_database(site):
-    """
-    Save the selected plant's regenerated 365-day CSV forecast to PostgreSQL.
-    """
-    df = load_csv_long_term(site)
-
-    if df.empty:
-        return False
-
-    return db.save_generation_forecast(
-        site=site,
-        forecast_df=df,
-        horizon="365_day",
-        source="XGBoost + historical monthly rainfall scenario",
-    )
-
-def load_long_term(site):
-    """
-    Load the latest forecast and keep it available across Streamlit reruns.
-
-    PostgreSQL is preferred. The local CSV remains a fallback.
-    """
-    current_site = st.session_state.get("forecast_site")
-
-    if (
-        current_site == site
-        and isinstance(st.session_state.get("long_forecast"), pd.DataFrame)
-        and not st.session_state["long_forecast"].empty
-    ):
-        return st.session_state["long_forecast"].copy()
-
-    if db.db_available():
-        try:
-            db_df = db.load_latest_generation_forecast(site, "365_day")
-            db_df = clean_forecast_dataframe(db_df, site)
-
-            if not db_df.empty:
-                st.session_state["long_forecast"] = db_df.copy()
-                st.session_state["forecast_site"] = site
-                return db_df
-        except Exception:
-            pass
-
-    csv_df = load_csv_long_term(site)
-
-    if not csv_df.empty:
-        st.session_state["long_forecast"] = csv_df.copy()
-        st.session_state["forecast_site"] = site
-
-    return csv_df
-
-
-def load_short_term_from_state(site):
-    if (
-        st.session_state.get("forecast_site") == site
-        and isinstance(st.session_state.get("short_forecast"), pd.DataFrame)
-    ):
-        return st.session_state["short_forecast"].copy()
-    return pd.DataFrame()
-
-
-
-
-def forecast_is_stale(df):
-    """
-    A rolling 365-day forecast is considered stale when its final
-    date is less than 330 days from today.
-    """
-    if df.empty:
-        return True
-
-    last_date = pd.to_datetime(df["Date"], errors="coerce").max()
-
-    if pd.isna(last_date):
-        return True
-
-    today = pd.Timestamp.today().normalize()
-    days_remaining = (last_date.normalize() - today).days
-
-    return days_remaining < 330
-
-
-
-# ============================================================
-# ACTUAL GENERATION + HISTORICAL BACKTEST HELPERS
-# ============================================================
-
-def load_actual_generation(site):
-    """Load actual daily generation and rainfall from the model-ready dataset."""
-    path = BASE_DIR / "data" / "HydroGen_Model_Ready_Dataset.csv"
-    if not path.exists():
-        return pd.DataFrame()
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        return pd.DataFrame()
-    required = {"Site", "Date", "Generation_kWh"}
-    if not required.issubset(df.columns):
-        return pd.DataFrame()
-    df["Site"] = df["Site"].astype(str).str.upper().str.strip()
-    df = df[df["Site"] == str(site).upper()].copy()
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["Generation_kWh"] = pd.to_numeric(df["Generation_kWh"], errors="coerce")
-    if "Rainfall_Input_mm" in df.columns:
-        df["Rainfall_Input_mm"] = pd.to_numeric(df["Rainfall_Input_mm"], errors="coerce")
-    else:
-        df["Rainfall_Input_mm"] = float("nan")
-    return (
-        df.dropna(subset=["Date", "Generation_kWh"])
-        .sort_values("Date")
-        .drop_duplicates("Date", keep="last")
-        [["Site", "Date", "Generation_kWh", "Rainfall_Input_mm"]]
-        .rename(columns={
-            "Generation_kWh": "Actual_Generation_kWh",
-            "Rainfall_Input_mm": "Actual_Rainfall_mm",
-        })
+@st.cache_data(show_spinner="Loading historical generation and rainfall data...")
+def load_data() -> pd.DataFrame:
+    if not DATA_PATH.exists():
+        raise FileNotFoundError(f"Dataset not found: {DATA_PATH}")
+    data = pd.read_csv(DATA_PATH)
+    required = {"Site", "Date", "Generation_kWh", "Rainfall_Input_mm"}
+    missing = required.difference(data.columns)
+    if missing:
+        raise ValueError(f"Dataset is missing columns: {', '.join(sorted(missing))}")
+
+    data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
+    data["Generation_kWh"] = pd.to_numeric(data["Generation_kWh"], errors="coerce")
+    data["Rainfall_Input_mm"] = pd.to_numeric(data["Rainfall_Input_mm"], errors="coerce")
+    data = data.dropna(subset=["Site", "Date", "Generation_kWh"]).copy()
+    data["Site"] = data["Site"].astype(str).str.strip()
+    data["Rainfall_Input_mm"] = data["Rainfall_Input_mm"].clip(lower=0)
+    data = (
+        data.sort_values(["Site", "Date"])
+        .drop_duplicates(["Site", "Date"], keep="last")
         .reset_index(drop=True)
     )
+    return data
 
 
-def load_historical_backtest(site):
-    path = BASE_DIR / "outputs" / "historical_backtest.csv"
-    if not path.exists():
-        return pd.DataFrame()
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        return pd.DataFrame()
-    if "Site" not in df.columns or "Date" not in df.columns:
-        return pd.DataFrame()
-    df["Site"] = df["Site"].astype(str).str.upper().str.strip()
-    df = df[df["Site"] == str(site).upper()].copy()
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    for col in [
-        "Actual_Generation_kWh", "Backtest_Forecast_Generation_kWh",
-        "Generation_Difference_kWh", "Absolute_Error_kWh",
-        "Absolute_Percentage_Error", "Actual_Rainfall_mm",
-        "Backtest_Rainfall_Input_mm",
-    ]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+@st.cache_resource
+def load_model(site: str):
+    model_path = MODEL_DIR / f"{site}_xgb_model.pkl"
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model file not found for {site}: {model_path}")
+    model = joblib.load(model_path)
+    if hasattr(model, "n_features_in_") and model.n_features_in_ != len(FEATURES):
+        raise ValueError(
+            f"{site} model expects {model.n_features_in_} features, "
+            f"but this app supplies {len(FEATURES)}. Retrain the model with "
+            "the supplied training script before deploying."
+        )
+    return model
 
 
-def error_summary(actual, predicted):
-    pair = pd.DataFrame({"actual": actual, "predicted": predicted})
-    pair["actual"] = pd.to_numeric(pair["actual"], errors="coerce")
-    pair["predicted"] = pd.to_numeric(pair["predicted"], errors="coerce")
-    pair = pair.dropna()
-    if pair.empty:
-        return None
-    error = pair["predicted"] - pair["actual"]
-    nonzero = pair["actual"].abs() > 0
-    return {
-        "MAE": float(error.abs().mean()),
-        "RMSE": float(np.sqrt(np.mean(np.square(error)))),
-        "MAPE": float((error[nonzero].abs() / pair.loc[nonzero, "actual"].abs()).mean() * 100)
-        if nonzero.any() else float("nan"),
-        "count": int(len(pair)),
+def create_feature_row(
+    future_date: pd.Timestamp,
+    history: pd.DataFrame,
+    rainfall: float,
+) -> pd.DataFrame:
+    """Create one forecast row using the same feature definitions as training."""
+    history = history.sort_values("Date").reset_index(drop=True)
+
+    def value_at_lag(column: str, days: int, fallback: float) -> float:
+        target_date = future_date - pd.Timedelta(days=days)
+        match = history.loc[history["Date"].eq(target_date), column].dropna()
+        if not match.empty:
+            return float(match.iloc[-1])
+        prior = history.loc[history["Date"].lt(future_date), column].dropna()
+        if not prior.empty:
+            return float(prior.tail(days).mean())
+        return float(fallback)
+
+    gen = history["Generation_kWh"].dropna()
+    rain = history["Rainfall_Input_mm"].dropna()
+    gen_fallback = float(gen.tail(30).mean()) if not gen.empty else 0.0
+    rain_fallback = float(rain.tail(30).median()) if not rain.empty else 0.0
+
+    lag1 = value_at_lag("Generation_kWh", 1, gen_fallback)
+    lag7 = value_at_lag("Generation_kWh", 7, gen_fallback)
+    lag14 = value_at_lag("Generation_kWh", 14, gen_fallback)
+    lag30 = value_at_lag("Generation_kWh", 30, gen_fallback)
+
+    previous_gen = gen.tail(30)
+    rolling7_gen = float(previous_gen.tail(7).mean()) if not previous_gen.empty else gen_fallback
+    rolling30_gen = float(previous_gen.mean()) if not previous_gen.empty else gen_fallback
+
+    lag_rain1 = value_at_lag("Rainfall_Input_mm", 1, rainfall if np.isfinite(rainfall) else rain_fallback)
+    lag_rain7 = value_at_lag("Rainfall_Input_mm", 7, rainfall if np.isfinite(rainfall) else rain_fallback)
+    lag_rain14 = value_at_lag("Rainfall_Input_mm", 14, rainfall if np.isfinite(rainfall) else rain_fallback)
+    lag_rain30 = value_at_lag("Rainfall_Input_mm", 30, rainfall if np.isfinite(rainfall) else rain_fallback)
+
+    previous_rain = rain.tail(30)
+    rolling7_rain = float(previous_rain.tail(7).sum()) if not previous_rain.empty else 0.0
+    rolling30_rain = float(previous_rain.sum()) if not previous_rain.empty else 0.0
+
+    coverage = float(history["Rainfall_Input_mm"].tail(30).notna().sum() / 30)
+    day_of_year = int(future_date.dayofyear)
+    week_of_year = int(future_date.isocalendar().week)
+
+    row = {
+        "Rainfall_Input_mm": max(float(rainfall), 0.0),
+        "Lag1_Generation_kWh": lag1,
+        "Lag7_Generation_kWh": lag7,
+        "Lag14_Generation_kWh": lag14,
+        "Lag30_Generation_kWh": lag30,
+        "Rolling7_Generation_kWh": rolling7_gen,
+        "Rolling30_Generation_kWh": rolling30_gen,
+        "Lag1_Rainfall_mm": lag_rain1,
+        "Lag7_Rainfall_mm": lag_rain7,
+        "Lag14_Rainfall_mm": lag_rain14,
+        "Lag30_Rainfall_mm": lag_rain30,
+        "Rolling7_Rainfall_mm": rolling7_rain,
+        "Rolling30_Rainfall_mm": rolling30_rain,
+        "Month": int(future_date.month),
+        "DayOfYear": day_of_year,
+        "WeekOfYear": week_of_year,
+        "Sin_DayOfYear": float(np.sin(2 * np.pi * day_of_year / 365.25)),
+        "Cos_DayOfYear": float(np.cos(2 * np.pi * day_of_year / 365.25)),
+        "Rainfall_Coverage_30D": coverage,
     }
+    return pd.DataFrame([[row[c] for c in FEATURES]], columns=FEATURES)
 
 
-# ============================================================
-# FORECAST FILTERS
-# ============================================================
+def forecast_plant(
+    data: pd.DataFrame,
+    site: str,
+    forecast_start: pd.Timestamp,
+    horizon_days: int,
+) -> tuple[pd.DataFrame, pd.Timestamp]:
+    """Bridge any historical-data gap recursively, then return requested dates."""
+    site_history = data.loc[data["Site"].eq(site), [
+        "Date", "Generation_kWh", "Rainfall_Input_mm"
+    ]].copy().sort_values("Date").reset_index(drop=True)
 
-def apply_forecast_filters(df, key_prefix="global"):
-    """
-    One persistent filter panel for the whole dashboard.
+    if site_history.empty:
+        raise ValueError(f"No historical records found for {site}.")
 
-    The filtered dataframe is stored in session state, so changing a
-    filter causes a Streamlit rerun without losing the generated forecast.
-    """
-    if df is None or df.empty or "Date" not in df.columns:
-        return pd.DataFrame()
+    model = load_model(site)
+    last_actual_date = site_history["Date"].max()
+    forecast_end = forecast_start + pd.Timedelta(days=horizon_days - 1)
 
-    filtered = df.copy()
-    filtered["Date"] = pd.to_datetime(filtered["Date"], errors="coerce")
-    filtered = filtered.dropna(subset=["Date"]).copy()
-
-    if filtered.empty:
-        return filtered
-
-    filtered["Year"] = filtered["Date"].dt.year
-    filtered["Month_Number"] = filtered["Date"].dt.month
-    filtered["Month_Name"] = filtered["Date"].dt.strftime("%B")
-
-    years = sorted(filtered["Year"].unique().tolist())
-    month_numbers = list(range(1, 13))
-    month_names = {
-        i: pd.Timestamp(year=2000, month=i, day=1).strftime("%B")
-        for i in month_numbers
-    }
-
-    f1, f2, f3 = st.columns([1.0, 1.25, 1.7])
-
-    with f1:
-        selected_years = st.multiselect(
-            "Year",
-            options=years,
-            default=years,
-            key=f"{key_prefix}_years",
-        )
-
-    with f2:
-        selected_months = st.multiselect(
-            "Month",
-            options=month_numbers,
-            default=month_numbers,
-            format_func=lambda x: month_names[x],
-            key=f"{key_prefix}_months",
-        )
-
-    min_date = filtered["Date"].min().date()
-    max_date = filtered["Date"].max().date()
-
-    with f3:
-        selected_dates = st.date_input(
-            "Date Range",
-            value=(min_date, max_date),
-            min_value=min_date,
-            max_value=max_date,
-            key=f"{key_prefix}_dates",
-        )
-
-    if isinstance(selected_dates, (tuple, list)) and len(selected_dates) == 2:
-        start_date = pd.Timestamp(selected_dates[0])
-        end_date = pd.Timestamp(selected_dates[1])
-    else:
-        start_date = pd.Timestamp(selected_dates)
-        end_date = start_date
-
-    if not selected_years or not selected_months:
-        return pd.DataFrame(columns=filtered.columns)
-
-    result = filtered[
-        filtered["Year"].isin(selected_years)
-        & filtered["Month_Number"].isin(selected_months)
-        & (filtered["Date"] >= start_date)
-        & (filtered["Date"] <= end_date)
-    ].copy()
-
-    return (
-        result.sort_values("Date")
-        .drop_duplicates(subset=["Date"], keep="last")
-        .reset_index(drop=True)
+    # Use the plant's historical median rainfall for the same calendar month.
+    # This is a baseline scenario, not a live weather forecast.
+    rain_profile = (
+        site_history.assign(Month=site_history["Date"].dt.month)
+        .groupby("Month")["Rainfall_Input_mm"]
+        .median()
+        .to_dict()
     )
+    fallback_rain = float(site_history["Rainfall_Input_mm"].median())
+    if not np.isfinite(fallback_rain):
+        fallback_rain = 0.0
+
+    # Fill the model's recursive history up to the requested forecast start.
+    # This is important when the latest uploaded actual data is older than today.
+    simulation_start = last_actual_date + pd.Timedelta(days=1)
+    simulation_end = forecast_end
+    all_dates = pd.date_range(simulation_start, simulation_end, freq="D")
+    history = site_history.copy()
+    results = []
+
+    for forecast_date in all_dates:
+        rainfall = float(rain_profile.get(int(forecast_date.month), fallback_rain))
+        if not np.isfinite(rainfall):
+            rainfall = fallback_rain
+
+        x_future = create_feature_row(forecast_date, history, rainfall)
+        prediction = float(model.predict(x_future)[0])
+        prediction = max(prediction, 0.0)
+
+        history = pd.concat(
+            [
+                history,
+                pd.DataFrame([{
+                    "Date": forecast_date,
+                    "Generation_kWh": prediction,
+                    "Rainfall_Input_mm": rainfall,
+                }]),
+            ],
+            ignore_index=True,
+        )
+
+        if forecast_date >= forecast_start:
+            results.append({
+                "Site": site,
+                "Date": forecast_date,
+                "Forecast_Generation_kWh": prediction,
+                "Forecast_Rainfall_mm": rainfall,
+                "Forecast_Type": "Historical monthly rainfall baseline",
+            })
+
+    return pd.DataFrame(results), last_actual_date
 
 
 # ============================================================
 # HEADER
 # ============================================================
-
-st.title("💧 Hydro Intelligence Agent")
+st.title("Hydro Intelligence Agent")
 st.caption(
-    "OpenWeather short-term forecasting + XGBoost generation forecasting "
-    "+ PostgreSQL forecast storage"
+    "Hydropower generation forecasting using historical plant performance, "
+    "rainfall patterns and plant-specific XGBoost models"
 )
 
-# ============================================================
-# API KEY CHECK
-# ============================================================
+st.markdown(
+    """
+    <div class="hero">
+        <div class="hero-kicker">Hydro generation planning</div>
+        <p class="hero-title">Forecast with confidence. Plan with intelligence.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-if not OPENWEATHER_API_KEY:
-    st.error(
-        "⚠️ OpenWeather API key is not configured. "
-        "Add OPENWEATHER_API_KEY to your .env file or Streamlit Secrets."
-    )
-    st.code(
-        "OPENWEATHER_API_KEY=YOUR_API_KEY_HERE\n"
-        "OPENWEATHER_UNITS=metric"
-    )
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+try:
+    historical = load_data()
+except Exception as exc:
+    st.error(f"Unable to load the forecasting dataset: {exc}")
     st.stop()
 
+sites = sorted(historical["Site"].dropna().unique().tolist())
+if not sites:
+    st.error("No hydro plant records were found in the dataset.")
+    st.stop()
+
+
 # ============================================================
-# ACTIVE DASHBOARD HEADER
+# SIDEBAR CONTROLS
 # ============================================================
+with st.sidebar:
+    st.subheader("Forecast Controls")
+    selected_site = st.selectbox("Select Hydro Plant", sites, index=sites.index("BBO") if "BBO" in sites else 0)
+    forecast_days = st.select_slider(
+        "Forecast horizon",
+        options=[7, 14, 30, 90, 180, 365],
+        value=365,
+        format_func=lambda x: f"{x} days",
+    )
+    run_forecast = st.button("Run Generation Forecast", type="primary", use_container_width=True)
+    st.caption("The forecast is recalculated when you change the plant or horizon.")
+    st.divider()
+    st.caption("Forecast inputs")
+    st.write("Historical generation")
+    st.write("Historical monthly rainfall profile")
+    st.write("Plant-specific XGBoost model")
 
-show_started_header()
 
 # ============================================================
-# SIDEBAR
+# RUN FORECAST
 # ============================================================
+today = pd.Timestamp(date.today())
+tomorrow = today + pd.Timedelta(days=1)
 
-st.sidebar.header("⚙️ Forecast Controls")
+try:
+    forecast_df, last_actual_date = forecast_plant(
+        historical,
+        selected_site,
+        tomorrow,
+        forecast_days,
+    )
+except Exception as exc:
+    st.error(f"Unable to generate the forecast for {selected_site}: {exc}")
+    st.stop()
 
-if st.sidebar.button("🏠 Back to Home", use_container_width=True):
-    st.session_state["hydro_agent_started"] = False
-    st.rerun()
+if forecast_df.empty:
+    st.warning("No forecast rows were generated. Check the model and historical data.")
+    st.stop()
 
-st.sidebar.markdown("---")
-
-site = st.sidebar.selectbox(
-    "🏭 Select Hydro Plant",
-    list(PLANTS.keys()),
-    format_func=lambda x: f"{x} — {PLANTS[x]['name']}",
+forecast_df["Date"] = pd.to_datetime(forecast_df["Date"])
+tomorrow_row = forecast_df.loc[forecast_df["Date"].eq(tomorrow)]
+tomorrow_generation = (
+    float(tomorrow_row["Forecast_Generation_kWh"].iloc[0])
+    if not tomorrow_row.empty else np.nan
+)
+tomorrow_rainfall = (
+    float(tomorrow_row["Forecast_Rainfall_mm"].iloc[0])
+    if not tomorrow_row.empty else np.nan
 )
 
-# When the user changes plant, clear only the old plant's in-memory
-# forecast so data from another plant cannot appear.
-if st.session_state.get("forecast_site") != site:
-    st.session_state["short_forecast"] = pd.DataFrame()
-    st.session_state["long_forecast"] = pd.DataFrame()
-    st.session_state["forecast_site"] = site
+# Latest actual data freshness is shown explicitly to prevent a stale-data
+# forecast from being mistaken for a real-time prediction.
+data_gap_days = max((today - last_actual_date.normalize()).days, 0)
 
-run_forecast = st.sidebar.button(
-    "🚀 Run Hydro Agent",
-    type="primary",
+st.subheader(f"{selected_site} Generation Forecast")
+st.markdown(
+    f"<p class='section-note'>Latest actual generation record: "
+    f"<b>{last_actual_date:%d %B %Y}</b> · Forecast date: "
+    f"<b>{tomorrow:%d %B %Y}</b></p>",
+    unsafe_allow_html=True,
+)
+
+if data_gap_days > 3:
+    st.warning(
+        f"The latest historical record is {data_gap_days} days old. "
+        "The model recursively estimates the gap before forecasting tomorrow. "
+        "Update the dataset with the latest actual generation and rainfall "
+        "measurements for a more dependable operational forecast."
+    )
+
+
+# ============================================================
+# TOMORROW'S GENERATION FORECAST
+# ============================================================
+st.subheader("Tomorrow's Generation Forecast")
+st.markdown(
+    f"<p class='section-note'>Forecast for {tomorrow:%A, %d %B %Y} "
+    f"using the selected plant's XGBoost model.</p>",
+    unsafe_allow_html=True,
+)
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric(
+    "Tomorrow's Generation",
+    f"{tomorrow_generation:,.0f} kWh" if np.isfinite(tomorrow_generation) else "N/A",
+)
+k2.metric(
+    "Expected Rainfall",
+    f"{tomorrow_rainfall:,.1f} mm" if np.isfinite(tomorrow_rainfall) else "N/A",
+)
+k3.metric("Forecast Horizon", f"{forecast_days} days")
+k4.metric("Latest Actual Date", last_actual_date.strftime("%d %b %Y"))
+
+st.info(
+    "Rainfall assumption: the historical median rainfall for the same calendar "
+    "month at this plant. This project archive does not contain a working live "
+    "weather connector, so this is a baseline rainfall scenario rather than "
+    "an OpenWeather forecast."
+)
+
+
+# ============================================================
+# 365-DAY GENERATION FORECAST
+# ============================================================
+st.subheader(f"{forecast_days}-Day Generation Forecast")
+st.markdown(
+    "<p class='section-note'>Daily predicted generation for the selected hydro plant.</p>",
+    unsafe_allow_html=True,
+)
+
+chart = go.Figure()
+chart.add_trace(
+    go.Scatter(
+        x=forecast_df["Date"],
+        y=forecast_df["Forecast_Generation_kWh"],
+        mode="lines",
+        name="Predicted generation",
+        line=dict(width=2.7, color="#1677b8"),
+        hovertemplate="%{x|%d %b %Y}<br>Generation: %{y:,.0f} kWh<extra></extra>",
+    )
+)
+chart.add_vline(
+    x=tomorrow,
+    line_width=1.5,
+    line_dash="dash",
+    line_color="#e58a27",
+)
+chart.update_layout(
+    height=390,
+    margin=dict(l=10, r=10, t=25, b=10),
+    paper_bgcolor="white",
+    plot_bgcolor="white",
+    hovermode="x unified",
+    legend=dict(orientation="h", y=1.12, x=0),
+    xaxis=dict(title="", showgrid=True, gridcolor="#e8edf2"),
+    yaxis=dict(title="Generation (kWh)", rangemode="tozero", showgrid=True, gridcolor="#e8edf2"),
+)
+st.plotly_chart(chart, use_container_width=True)
+
+
+# ============================================================
+# MONTHLY SUMMARY
+# ============================================================
+st.subheader("Monthly Generation Forecast")
+monthly = (
+    forecast_df.assign(Month=forecast_df["Date"].dt.to_period("M").astype(str))
+    .groupby("Month", as_index=False)
+    .agg(
+        Forecast_Generation_kWh=("Forecast_Generation_kWh", "sum"),
+        Average_Daily_Generation_kWh=("Forecast_Generation_kWh", "mean"),
+        Forecast_Rainfall_mm=("Forecast_Rainfall_mm", "sum"),
+    )
+)
+monthly_chart = go.Figure()
+monthly_chart.add_trace(
+    go.Bar(
+        x=monthly["Month"],
+        y=monthly["Forecast_Generation_kWh"],
+        name="Monthly generation",
+        marker_color="#3a91c8",
+        hovertemplate="%{x}<br>Generation: %{y:,.0f} kWh<extra></extra>",
+    )
+)
+monthly_chart.update_layout(
+    height=320,
+    margin=dict(l=10, r=10, t=15, b=10),
+    paper_bgcolor="white",
+    plot_bgcolor="white",
+    xaxis_title="Month",
+    yaxis_title="Forecast generation (kWh)",
+    xaxis=dict(showgrid=False),
+    yaxis=dict(showgrid=True, gridcolor="#e8edf2", rangemode="tozero"),
+)
+st.plotly_chart(monthly_chart, use_container_width=True)
+
+# ============================================================
+# FORECAST TABLE AND DOWNLOAD
+# ============================================================
+st.subheader("Daily Forecast Details")
+display_df = forecast_df.copy()
+display_df["Date"] = display_df["Date"].dt.strftime("%d %b %Y")
+display_df = display_df.rename(columns={
+    "Site": "Plant",
+    "Date": "Forecast Date",
+    "Forecast_Generation_kWh": "Forecast Generation (kWh)",
+    "Forecast_Rainfall_mm": "Assumed Rainfall (mm)",
+    "Forecast_Type": "Rainfall Scenario",
+})
+st.dataframe(
+    display_df,
     use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Forecast Generation (kWh)": st.column_config.NumberColumn(format="%,.0f"),
+        "Assumed Rainfall (mm)": st.column_config.NumberColumn(format="%.1f"),
+    },
 )
 
-refresh_365 = st.sidebar.button(
-    "🔄 Refresh 365-Day Forecast",
-    use_container_width=True,
+csv_bytes = forecast_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "Download Forecast as CSV",
+    data=csv_bytes,
+    file_name=f"{selected_site}_generation_forecast_{tomorrow:%Y%m%d}.csv",
+    mime="text/csv",
 )
 
-st.sidebar.markdown("---")
-
-if DB_STATUS == "Connected":
-    st.sidebar.success("🗄️ PostgreSQL: Connected")
-else:
-    st.sidebar.warning(
-        "🗄️ PostgreSQL: Not connected\n\n"
-        "Set DATABASE_URL in .env or Streamlit Secrets."
-    )
-
-# ============================================================
-# PLANT INFORMATION
-# ============================================================
-
-plant = PLANTS[site]
-
-st.subheader(f"🏭 {site} — {plant['name']}")
-
-c1, c2, c3 = st.columns(3)
-
-with c1:
-    st.metric("Plant", site)
-
-with c2:
-    st.metric(
-        "Latitude",
-        f"{plant['lat']:.5f}" if plant.get("lat") is not None else "Not configured",
-    )
-
-with c3:
-    st.metric(
-        "Longitude",
-        f"{plant['lon']:.5f}" if plant.get("lon") is not None else "Not configured",
-    )
-
-# ============================================================
-# REFRESH 365-DAY FORECAST
-# ============================================================
-
-if refresh_365:
-    try:
-        with st.spinner("📅 Regenerating rolling 365-day generation forecast..."):
-            run_long_term_forecast(site)
-
-            if db.db_available():
-                save_long_term_to_database(site)
-
-            # Reload fresh data into session state.
-            fresh_long = load_csv_long_term(site)
-            if fresh_long.empty:
-                fresh_long = load_long_term(site)
-
-            st.session_state["long_forecast"] = fresh_long.copy()
-            st.session_state["forecast_site"] = site
-            st.cache_data.clear()
-
-        st.success(f"✅ 365-day forecast refreshed for {site}.")
-    except Exception as e:
-        st.error("❌ 365-day forecast refresh failed.")
-        st.exception(e)
-
-# ============================================================
-# RUN AGENT
-# ============================================================
-
-if run_forecast:
-    try:
-        with st.spinner("🌧️ Getting upcoming weather forecast..."):
-            weather_daily, raw_weather, plant_data = get_weather_forecast(site)
-
-        if db.db_available():
-            try:
-                db.save_weather_forecast(
-                    site=site,
-                    weather_daily=weather_daily,
-                    raw_weather=raw_weather,
-                )
-            except Exception as db_error:
-                st.warning(
-                    f"Weather was retrieved, but database storage failed: {db_error}"
-                )
-
-        with st.spinner("⚡ Predicting upcoming generation..."):
-            short_forecast = run_hydro_forecast(
-                site=site,
-                weather_daily=weather_daily,
-                data_path="data/HydroGen_Model_Ready_Dataset.csv",
-            )
-
-        short_forecast = clean_forecast_dataframe(short_forecast, site)
-
-        st.session_state["short_forecast"] = short_forecast.copy()
-        st.session_state["forecast_site"] = site
-
-        if db.db_available() and not short_forecast.empty:
-            try:
-                db.save_generation_forecast(
-                    site=site,
-                    forecast_df=short_forecast,
-                    horizon="short_term",
-                    source="OpenWeather + XGBoost",
-                )
-            except Exception as db_error:
-                st.warning(
-                    f"Forecast was generated, but database storage failed: {db_error}"
-                )
-
-        long_forecast = load_long_term(site)
-
-        if long_forecast.empty or forecast_is_stale(long_forecast):
-            with st.spinner("📅 Updating the rolling 365-day forecast..."):
-                try:
-                    run_long_term_forecast(site)
-
-                    if db.db_available():
-                        save_long_term_to_database(site)
-
-                    long_forecast = load_csv_long_term(site)
-                    st.session_state["long_forecast"] = long_forecast.copy()
-                    st.session_state["forecast_site"] = site
-
-                except Exception as long_error:
-                    if long_forecast.empty:
-                        raise long_error
-                    st.warning(
-                        "The existing long-term forecast is being shown "
-                        "because the latest 365-day refresh failed."
-                    )
-
-        st.success("✅ Hydro Intelligence Agent completed successfully.")
-
-    except Exception as e:
-        st.error("❌ Hydro Intelligence Agent failed.")
-        st.exception(e)
-
-# ============================================================
-# ALWAYS LOAD PERSISTED FORECASTS
-# IMPORTANT:
-# Streamlit reruns the entire script whenever a filter changes.
-# Therefore charts must NOT be inside `if run_forecast:`.
-# ============================================================
-
-short_forecast = load_short_term_from_state(site)
-long_forecast = load_long_term(site)
-
-# ============================================================
-# GLOBAL FORECAST FILTERS
-# One filter panel controls all long-term charts.
-# ============================================================
-
-st.markdown("---")
-st.header("🔎 Forecast Filters")
 st.caption(
-    "Use Year, Month and Date Range to update the KPIs, charts and "
-    "forecast table below. The selected forecast remains available "
-    "when filters change."
+    "Model outputs are estimates, not guaranteed generation values. "
+    "Forecast quality depends on recent, complete historical records, "
+    "rainfall inputs and validation performance for each plant."
 )
-
-if long_forecast.empty:
-    st.info(
-        "No 365-day forecast is loaded yet. "
-        "Click **Run Hydro Agent** or **Refresh 365-Day Forecast**."
-    )
-else:
-    filtered_long = apply_forecast_filters(
-        long_forecast,
-        key_prefix=f"{site}_global_filter",
-    )
-
-    if filtered_long.empty:
-        st.warning("No forecast data matches the selected filters.")
-    else:
-        # ========================================================
-        # FILTERED KPI CARDS
-        # ========================================================
-
-        filtered_generation = filtered_long["Forecast_Generation_kWh"]
-
-        filtered_total = filtered_generation.sum()
-        filtered_average = filtered_generation.mean()
-        filtered_max = filtered_generation.max()
-        filtered_days = filtered_long["Date"].nunique()
-
-        a1, a2, a3, a4 = st.columns([1, 1.55, 1.25, 1.25])
-
-        with a1:
-            kpi_card("Forecast Days", f"{filtered_days:,}")
-
-        with a2:
-            kpi_card("Forecast Generation", f"{filtered_total:,.0f} kWh")
-
-        with a3:
-            kpi_card("Average Daily", f"{filtered_average:,.0f} kWh")
-
-        with a4:
-            kpi_card("Maximum Daily", f"{filtered_max:,.0f} kWh")
-
-        # ========================================================
-        # TABS
-        # All tabs use the SAME filtered dataframe.
-        # ========================================================
-
-        tab1, tab2, tab3, tab4 = st.tabs(
-            [
-                "🌧️ Upcoming Days",
-                "📅 Next 12 Months",
-                "📊 Monthly Outlook",
-                "🎯 Actual vs Forecast",
-            ]
-        )
-
-        # ========================================================
-        # TAB 1 — UPCOMING DAYS
-        # ========================================================
-
-        with tab1:
-            st.header("🌧️ Upcoming Days Forecast")
-            st.caption("OpenWeather rainfall forecast → XGBoost generation")
-
-            if short_forecast.empty:
-                st.info(
-                    "No short-term forecast is loaded. "
-                    "Click **Run Hydro Agent**."
-                )
-            else:
-                total_gen = short_forecast["Forecast_Generation_kWh"].sum()
-                avg_gen = short_forecast["Forecast_Generation_kWh"].mean()
-
-                total_rain = (
-                    short_forecast["Forecast_Rainfall_mm"].sum()
-                    if "Forecast_Rainfall_mm" in short_forecast.columns
-                    else 0
-                )
-
-                k1, k2, k3 = st.columns(3)
-
-                with k1:
-                    kpi_card("Forecast Generation", f"{total_gen:,.0f} kWh")
-
-                with k2:
-                    kpi_card("Average Daily Generation", f"{avg_gen:,.0f} kWh")
-
-                with k3:
-                    kpi_card("Forecast Rainfall", f"{total_rain:,.1f} mm")
-
-                st.subheader("⚡ Upcoming Generation")
-
-                gen_chart = short_forecast.copy()
-                gen_chart["Date"] = pd.to_datetime(gen_chart["Date"])
-                gen_chart = (
-                    gen_chart.sort_values("Date")
-                    .drop_duplicates("Date", keep="last")
-                    .set_index("Date")
-                )
-
-                st.line_chart(
-                    gen_chart[["Forecast_Generation_kWh"]],
-                    height=350,
-                )
-
-                if "Forecast_Rainfall_mm" in short_forecast.columns:
-                    st.subheader("🌧️ Upcoming Rainfall")
-
-                    rain_chart = short_forecast.copy()
-                    rain_chart["Date"] = pd.to_datetime(rain_chart["Date"])
-                    rain_chart = (
-                        rain_chart.sort_values("Date")
-                        .drop_duplicates("Date", keep="last")
-                        .set_index("Date")
-                    )
-
-                    st.line_chart(
-                        rain_chart[["Forecast_Rainfall_mm"]],
-                        height=300,
-                    )
-
-                st.subheader("📋 Upcoming Forecast Details")
-
-                display = short_forecast.copy()
-                display["Date"] = pd.to_datetime(display["Date"]).dt.date
-
-                st.dataframe(
-                    display,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-        # ========================================================
-        # TAB 2 — NEXT 12 MONTHS
-        # ========================================================
-
-        with tab2:
-            st.header("📅 Next 12 Months Generation Forecast")
-
-            st.subheader("⚡ 365-Day Generation Forecast")
-
-            chart = filtered_long[
-                ["Date", "Forecast_Generation_kWh"]
-            ].copy()
-
-            chart["Date"] = pd.to_datetime(chart["Date"])
-
-            chart = (
-                chart.sort_values("Date")
-                .drop_duplicates("Date", keep="last")
-                .set_index("Date")
-            )
-
-            st.line_chart(
-                chart[["Forecast_Generation_kWh"]],
-                height=420,
-            )
-
-            if "Forecast_Rainfall_mm" in filtered_long.columns:
-                st.subheader("🌧️ Long-Term Rainfall Input")
-
-                rain = filtered_long[
-                    ["Date", "Forecast_Rainfall_mm"]
-                ].copy()
-
-                rain["Date"] = pd.to_datetime(rain["Date"])
-
-                rain = (
-                    rain.sort_values("Date")
-                    .drop_duplicates("Date", keep="last")
-                    .set_index("Date")
-                )
-
-                st.line_chart(
-                    rain[["Forecast_Rainfall_mm"]],
-                    height=300,
-                )
-
-            st.subheader("📋 Forecast Details")
-
-            display_filtered = filtered_long.copy()
-            display_filtered["Date"] = pd.to_datetime(
-                display_filtered["Date"]
-            ).dt.date
-
-            display_filtered = display_filtered.drop(
-                columns=[
-                    "Year",
-                    "Month_Number",
-                    "Month_Name",
-                ],
-                errors="ignore",
-            )
-
-            st.dataframe(
-                display_filtered,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            csv = display_filtered.to_csv(index=False)
-
-            st.download_button(
-                "📥 Download Filtered Forecast",
-                data=csv,
-                file_name=f"{site}_filtered_forecast.csv",
-                mime="text/csv",
-                key=f"{site}_download_filtered",
-            )
-
-        # ========================================================
-        # TAB 3 — MONTHLY OUTLOOK
-        # ========================================================
-
-        with tab3:
-            st.header("📊 Monthly Generation Outlook")
-
-            monthly = (
-                filtered_long.assign(
-                    Year=filtered_long["Date"].dt.year,
-                    Month_Number=filtered_long["Date"].dt.month,
-                    Month=filtered_long["Date"].dt.strftime("%b"),
-                )
-                .groupby(
-                    ["Year", "Month_Number", "Month"],
-                    as_index=False,
-                )["Forecast_Generation_kWh"]
-                .sum()
-                .sort_values(["Year", "Month_Number"])
-            )
-
-            monthly["Year_Month"] = (
-                monthly["Year"].astype(str)
-                + "-"
-                + monthly["Month"]
-            )
-
-            st.subheader("📊 Monthly Generation")
-
-            st.bar_chart(
-                monthly.set_index("Year_Month")[
-                    "Forecast_Generation_kWh"
-                ],
-                height=420,
-            )
-
-            st.dataframe(
-                monthly,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        # ========================================================
-        # TAB 4 — ACTUAL VS FORECAST + HISTORICAL TRENDS
-        # ========================================================
-
-        with tab4:
-            st.header("🎯 Actual vs Forecast Generation")
-            st.caption(
-                "Historical one-day-ahead backtest and actual observations. "
-                "Future dates are compared only after actual data is recorded."
-            )
-
-            actuals = load_actual_generation(site)
-            backtest = load_historical_backtest(site)
-
-            # Merge latest actual observations with saved forecasts for any dates
-            # where an actual value has since become available.
-            future_comparison = long_forecast.merge(
-                actuals[["Date", "Actual_Generation_kWh", "Actual_Rainfall_mm"]],
-                on="Date",
-                how="left",
-            ) if not long_forecast.empty and not actuals.empty else pd.DataFrame()
-
-            if not future_comparison.empty:
-                future_comparison = future_comparison.dropna(
-                    subset=["Actual_Generation_kWh"]
-                ).copy()
-                if not future_comparison.empty:
-                    future_comparison["Generation_Difference_kWh"] = (
-                        future_comparison["Forecast_Generation_kWh"]
-                        - future_comparison["Actual_Generation_kWh"]
-                    )
-                    future_comparison["Absolute_Error_kWh"] = (
-                        future_comparison["Generation_Difference_kWh"].abs()
-                    )
-                    future_comparison["Absolute_Percentage_Error"] = np.where(
-                        future_comparison["Actual_Generation_kWh"].abs() > 0,
-                        future_comparison["Absolute_Error_kWh"]
-                        / future_comparison["Actual_Generation_kWh"].abs() * 100,
-                        np.nan,
-                    )
-
-            if not backtest.empty:
-                metrics = error_summary(
-                    backtest["Actual_Generation_kWh"],
-                    backtest["Backtest_Forecast_Generation_kWh"],
-                )
-                if metrics:
-                    m1, m2, m3, m4 = st.columns(4)
-                    with m1:
-                        kpi_card("Backtest MAE", f"{metrics['MAE']:,.0f} kWh")
-                    with m2:
-                        kpi_card("Backtest RMSE", f"{metrics['RMSE']:,.0f} kWh")
-                    with m3:
-                        kpi_card(
-                            "Backtest MAPE",
-                            f"{metrics['MAPE']:.2f}%" if np.isfinite(metrics["MAPE"]) else "N/A",
-                        )
-                    with m4:
-                        kpi_card("Compared Days", f"{metrics['count']:,}")
-
-                st.subheader("Daily Historical Generation: Actual vs Backtest")
-                bt_chart = backtest[
-                    ["Date", "Actual_Generation_kWh", "Backtest_Forecast_Generation_kWh"]
-                ].dropna().sort_values("Date").set_index("Date")
-                st.line_chart(bt_chart, height=360)
-
-                st.subheader("Daily Historical Rainfall")
-                rain_cols = [
-                    c for c in ["Actual_Rainfall_mm", "Backtest_Rainfall_Input_mm"]
-                    if c in backtest.columns
-                ]
-                if rain_cols:
-                    rain_chart = backtest[["Date"] + rain_cols].dropna(
-                        subset=["Date"]
-                    ).sort_values("Date").set_index("Date")
-                    st.line_chart(rain_chart, height=280)
-
-                monthly_bt = backtest.copy()
-                monthly_bt["Year"] = monthly_bt["Date"].dt.year
-                monthly_bt["Month_Number"] = monthly_bt["Date"].dt.month
-                monthly_bt["Month"] = monthly_bt["Date"].dt.strftime("%b")
-                monthly_bt = monthly_bt.groupby(
-                    ["Year", "Month_Number", "Month"], as_index=False
-                ).agg(
-                    Actual_Generation_kWh=("Actual_Generation_kWh", "sum"),
-                    Backtest_Forecast_Generation_kWh=("Backtest_Forecast_Generation_kWh", "sum"),
-                    Actual_Rainfall_mm=("Actual_Rainfall_mm", "sum"),
-                    MAE_kWh=("Absolute_Error_kWh", "mean"),
-                    MAPE_Percent=("Absolute_Percentage_Error", "mean"),
-                ).sort_values(["Year", "Month_Number"])
-                monthly_bt["Year_Month"] = (
-                    monthly_bt["Year"].astype(str) + "-" + monthly_bt["Month"]
-                )
-
-                st.subheader("Monthly Actual vs Backtest Generation")
-                st.bar_chart(
-                    monthly_bt.set_index("Year_Month")[
-                        ["Actual_Generation_kWh", "Backtest_Forecast_Generation_kWh"]
-                    ],
-                    height=360,
-                )
-                st.subheader("Monthly Generation and Error Details")
-                st.dataframe(monthly_bt, use_container_width=True, hide_index=True)
-
-                st.subheader("Daily Backtest Error Details")
-                daily_bt = backtest.copy()
-                daily_bt["Date"] = daily_bt["Date"].dt.date
-                st.dataframe(
-                    daily_bt.sort_values("Date", ascending=False),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                st.download_button(
-                    "📥 Download Historical Comparison",
-                    data=backtest.to_csv(index=False),
-                    file_name=f"{site}_historical_actual_vs_forecast.csv",
-                    mime="text/csv",
-                    key=f"{site}_download_backtest",
-                )
-            else:
-                st.info(
-                    "Historical backtest data is not available yet. Click "
-                    "**Refresh 365-Day Forecast** to run forecast.py, which also "
-                    "generates outputs/historical_backtest.csv. Ensure the site's "
-                    "model and feature files are present."
-                )
-
-            if not future_comparison.empty:
-                st.subheader("Actuals Recorded for Previously Forecast Dates")
-                st.caption(
-                    "This table appears only for forecast dates that now have actual generation."
-                )
-                fc_display = future_comparison.copy()
-                fc_display["Date"] = fc_display["Date"].dt.date
-                st.dataframe(
-                    fc_display.sort_values("Date", ascending=False),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            elif not actuals.empty:
-                st.info(
-                    "Actual generation is available in the dataset, but none of its dates "
-                    "overlap with the currently stored 365-day forecast. Historical "
-                    "backtest results above provide the available comparison."
-                )
-
-            if actuals.empty:
-                st.warning(
-                    "No actual generation data could be loaded. Check that "
-                    "data/HydroGen_Model_Ready_Dataset.csv contains Site, Date, "
-                    "Generation_kWh and (ideally) Rainfall_Input_mm."
-                )
-
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.markdown("---")
-st.caption(
-    "Hydro Intelligence Agent | OpenWeather + XGBoost + PostgreSQL"
-)
-
