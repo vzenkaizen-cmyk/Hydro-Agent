@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date
 
-import joblib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from xgboost import XGBRegressor
 
 
 # ============================================================
@@ -146,19 +146,145 @@ def load_data() -> pd.DataFrame:
     return data
 
 
-@st.cache_resource
-def load_model(site: str):
-    model_path = MODEL_DIR / f"{site}_xgb_model.pkl"
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model file not found for {site}: {model_path}")
-    model = joblib.load(model_path)
-    if hasattr(model, "n_features_in_") and model.n_features_in_ != len(FEATURES):
+@st.cache_resource(show_spinner=False)
+def train_site_model(site: str, data_signature: str) -> dict:
+    """
+    Chronological model selection:
+      70% train, 15% validation, 15% final test.
+    The final test is not used for hyperparameter selection.
+    A separate production model is then fitted on all eligible historical rows.
+    """
+    data = load_data()
+    site_data = data.loc[data["Site"].eq(site)].sort_values("Date").copy()
+
+    missing_features = [c for c in FEATURES if c not in site_data.columns]
+    if missing_features:
         raise ValueError(
-            f"{site} model expects {model.n_features_in_} features, "
-            f"but this app supplies {len(FEATURES)}. Retrain the model with "
-            "the supplied training script before deploying."
+            "Dataset is missing model features: " + ", ".join(missing_features)
         )
-    return model
+
+    if "Model_Ready" in site_data.columns:
+        ready = site_data["Model_Ready"].astype(str).str.strip().str.lower()
+        site_data = site_data.loc[ready.isin(["true", "1", "yes", "y"])].copy()
+
+    numeric_cols = FEATURES + ["Generation_kWh"]
+    for col in numeric_cols:
+        site_data[col] = pd.to_numeric(site_data[col], errors="coerce")
+
+    site_data = site_data.replace([np.inf, -np.inf], np.nan)
+    site_data = site_data.dropna(subset=numeric_cols).sort_values("Date").reset_index(drop=True)
+
+    if len(site_data) < 100:
+        raise ValueError(
+            f"{site} has only {len(site_data)} model-ready rows. "
+            "At least 100 rows are recommended for chronological train/validation/test evaluation."
+        )
+
+    X = site_data[FEATURES].astype(float)
+    y = site_data["Generation_kWh"].astype(float)
+
+    n = len(site_data)
+    train_end = int(n * 0.70)
+    validation_end = int(n * 0.85)
+
+    if train_end < 30 or validation_end <= train_end or validation_end >= n:
+        raise ValueError("Not enough rows to create chronological train/validation/test sets.")
+
+    X_train, y_train = X.iloc[:train_end], y.iloc[:train_end]
+    X_val, y_val = X.iloc[train_end:validation_end], y.iloc[train_end:validation_end]
+    X_test, y_test = X.iloc[validation_end:], y.iloc[validation_end:]
+
+    candidates = [
+        {"n_estimators": 350, "max_depth": 3, "learning_rate": 0.03,
+         "subsample": 0.85, "colsample_bytree": 0.85, "reg_lambda": 5.0},
+        {"n_estimators": 500, "max_depth": 3, "learning_rate": 0.025,
+         "subsample": 0.90, "colsample_bytree": 0.90, "reg_lambda": 8.0},
+        {"n_estimators": 350, "max_depth": 4, "learning_rate": 0.03,
+         "subsample": 0.85, "colsample_bytree": 0.85, "reg_lambda": 8.0},
+    ]
+
+    best_params = None
+    best_val_mae = float("inf")
+    for params in candidates:
+        candidate = XGBRegressor(
+            objective="reg:squarederror",
+            random_state=42,
+            n_jobs=-1,
+            **params,
+        )
+        candidate.fit(X_train, y_train, verbose=False)
+        val_pred = np.maximum(candidate.predict(X_val), 0)
+        val_mae = float(np.mean(np.abs(y_val.to_numpy() - val_pred)))
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
+            best_params = params
+
+    # Final unbiased holdout model: train + validation only.
+    test_model = XGBRegressor(
+        objective="reg:squarederror",
+        random_state=42,
+        n_jobs=-1,
+        **best_params,
+    )
+    test_model.fit(
+        pd.concat([X_train, X_val]),
+        pd.concat([y_train, y_val]),
+        verbose=False,
+    )
+    test_prediction = np.maximum(test_model.predict(X_test), 0)
+
+    test_results = site_data.iloc[validation_end:].copy().reset_index(drop=True)
+    test_results["Actual_Generation_kWh"] = y_test.to_numpy()
+    test_results["Forecast_Generation_kWh"] = test_prediction
+    test_results["Generation_Difference_kWh"] = (
+        test_results["Forecast_Generation_kWh"] - test_results["Actual_Generation_kWh"]
+    )
+    test_results["Absolute_Error_kWh"] = test_results["Generation_Difference_kWh"].abs()
+    actual_denominator = test_results["Actual_Generation_kWh"].abs().replace(0, np.nan)
+    test_results["Error_Percentage"] = (
+        100 * test_results["Absolute_Error_kWh"] / actual_denominator
+    )
+    # In this one-day-ahead holdout, measured rainfall is an input feature,
+    # not an independently predicted rainfall forecast.
+    test_results["Actual_Rainfall_mm"] = test_results["Rainfall_Input_mm"]
+
+    actual = test_results["Actual_Generation_kWh"].to_numpy()
+    predicted = test_results["Forecast_Generation_kWh"].to_numpy()
+    errors = predicted - actual
+    mae = float(np.mean(np.abs(errors)))
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
+    nonzero = np.abs(actual) > 0
+    mape = float(np.mean(np.abs(errors[nonzero] / actual[nonzero])) * 100) if nonzero.any() else np.nan
+    wape_denominator = float(np.sum(np.abs(actual)))
+    wape = float(np.sum(np.abs(errors)) / wape_denominator * 100) if wape_denominator else np.nan
+    if len(actual) > 1 and np.var(actual) > 0:
+        ss_res = float(np.sum(errors ** 2))
+        ss_tot = float(np.sum((actual - np.mean(actual)) ** 2))
+        r2 = 1 - ss_res / ss_tot
+    else:
+        r2 = np.nan
+
+    # Production model uses all available model-ready records only after evaluation.
+    production_model = XGBRegressor(
+        objective="reg:squarederror",
+        random_state=42,
+        n_jobs=-1,
+        **best_params,
+    )
+    production_model.fit(X, y, verbose=False)
+
+    return {
+        "model": production_model,
+        "test_results": test_results,
+        "metrics": {
+            "MAE": mae, "RMSE": rmse, "MAPE": mape, "WAPE": wape, "R2": r2,
+            "Validation_MAE": best_val_mae,
+        },
+        "best_params": best_params,
+        "counts": {
+            "total": n, "train": len(X_train), "validation": len(X_val), "test": len(X_test)
+        },
+    }
 
 
 def create_feature_row(
@@ -170,13 +296,14 @@ def create_feature_row(
     history = history.sort_values("Date").reset_index(drop=True)
 
     def value_at_lag(column: str, days: int, fallback: float) -> float:
-        target_date = future_date - pd.Timedelta(days=days)
-        match = history.loc[history["Date"].eq(target_date), column].dropna()
-        if not match.empty:
-            return float(match.iloc[-1])
+        # Lag features are row shifts in the daily training series. Use the
+        # corresponding previous observation; never replace a lag with an
+        # average of unrelated recent values.
         prior = history.loc[history["Date"].lt(future_date), column].dropna()
+        if len(prior) >= days:
+            return float(prior.iloc[-days])
         if not prior.empty:
-            return float(prior.tail(days).mean())
+            return float(prior.iloc[0])
         return float(fallback)
 
     gen = history["Generation_kWh"].dropna()
@@ -235,6 +362,7 @@ def forecast_plant(
     site: str,
     forecast_start: pd.Timestamp,
     horizon_days: int,
+    model,
 ) -> tuple[pd.DataFrame, pd.Timestamp]:
     """Bridge any historical-data gap recursively, then return requested dates."""
     site_history = data.loc[data["Site"].eq(site), [
@@ -244,7 +372,6 @@ def forecast_plant(
     if site_history.empty:
         raise ValueError(f"No historical records found for {site}.")
 
-    model = load_model(site)
     last_actual_date = site_history["Date"].max()
     forecast_end = forecast_start + pd.Timedelta(days=horizon_days - 1)
 
@@ -360,29 +487,6 @@ def build_comparison(actual: pd.DataFrame, predicted: pd.DataFrame) -> pd.DataFr
     return joined
 
 
-def monthly_comparison(daily: pd.DataFrame) -> pd.DataFrame:
-    frame = daily.copy()
-    frame["Month"] = frame["Date"].dt.to_period("M").astype(str)
-    # Aggregate only days with actual generation for fair monthly comparisons.
-    paired = frame.loc[frame["Actual_Generation_kWh"].notna()].copy()
-    if paired.empty:
-        return pd.DataFrame()
-    paired["Rainfall_Pair"] = paired["Actual_Rainfall_mm"].notna()
-    paired["Forecast_Rainfall_Paired_mm"] = paired["Forecast_Rainfall_mm"].where(paired["Rainfall_Pair"])
-    result = paired.groupby("Month", as_index=False).agg(
-        Days_Compared=("Date", "count"),
-        Actual_Generation_kWh=("Actual_Generation_kWh", "sum"),
-        Forecast_Generation_kWh=("Forecast_Generation_kWh", "sum"),
-        Actual_Rainfall_mm=("Actual_Rainfall_mm", lambda x: x.sum(min_count=1)),
-        Forecast_Rainfall_mm=("Forecast_Rainfall_Paired_mm", lambda x: x.sum(min_count=1)),
-    )
-    result["Generation_Difference_kWh"] = result["Forecast_Generation_kWh"] - result["Actual_Generation_kWh"]
-    denom = result["Actual_Generation_kWh"].where(result["Actual_Generation_kWh"].ne(0))
-    result["Error_Percentage"] = 100 * result["Generation_Difference_kWh"].abs() / denom
-    result["Rainfall_Difference_mm"] = result["Forecast_Rainfall_mm"] - result["Actual_Rainfall_mm"]
-    return result
-
-
 def comparison_chart(df: pd.DataFrame, actual_col: str, forecast_col: str,
                      title: str, yaxis: str, bars: bool = False):
     fig = go.Figure()
@@ -411,7 +515,7 @@ with st.sidebar:
                                      value=30, format_func=lambda x: f"{x} days")
     validation_days = st.select_slider("Historical validation window", options=[7, 14, 30, 60, 90],
                                        value=30, format_func=lambda x: f"{x} days")
-    st.caption("Validation simulates forecasts from a past cutoff date, then compares them with actual measurements.")
+    st.caption("Controls how many recent chronological test days are shown in the comparison.")
     st.divider()
     st.caption("Forecast inputs: plant-specific XGBoost model, historical generation and monthly rainfall baseline")
 
@@ -419,12 +523,18 @@ site_history = historical.loc[historical["Site"].eq(selected_site)].copy().sort_
 today = pd.Timestamp(date.today())
 tomorrow = today + pd.Timedelta(days=1)
 
-# Forecast future dates using existing plant model and recursive feature generation.
+# Train/evaluate chronologically, then use the production model for future forecasts.
 try:
+    stat = DATA_PATH.stat()
+    data_signature = f"{stat.st_mtime_ns}-{stat.st_size}"
+    with st.spinner("Training and validating the plant-specific XGBoost model..."):
+        trained = train_site_model(selected_site, data_signature)
     with st.spinner("Calculating upcoming generation forecasts..."):
-        forecast_df, last_actual_date = forecast_plant(historical, selected_site, tomorrow, forecast_days)
+        forecast_df, last_actual_date = forecast_plant(
+            historical, selected_site, tomorrow, forecast_days, trained["model"]
+        )
 except Exception as exc:
-    st.error(f"Unable to forecast {selected_site}: {exc}")
+    st.error(f"Unable to prepare the {selected_site} forecasting model: {exc}")
     st.stop()
 
 if forecast_df.empty:
@@ -481,77 +591,141 @@ st.subheader("Upcoming Monthly Generation and Rainfall")
 st.dataframe(future_monthly, use_container_width=True, hide_index=True)
 st.caption("Partial months include only the forecast dates within the selected horizon.")
 
-# Genuine out-of-sample-style historical replay: remove validation dates before forecasting.
+# ============================================================
+# CHRONOLOGICAL HOLDOUT VALIDATION
+# ============================================================
 st.subheader("Historical Actual vs Forecast Comparison")
-actual_through_today = site_history.loc[site_history["Date"].le(today)].copy()
-if len(actual_through_today) < validation_days + 35:
-    st.warning("Not enough historical observations for the chosen validation window. "
-               "Choose a shorter window or provide more historical data.")
+
+test_results = trained["test_results"].copy()
+test_results["Date"] = pd.to_datetime(test_results["Date"])
+metrics = trained["metrics"]
+counts = trained["counts"]
+
+st.caption(
+    f"Chronological split: {counts['train']:,} training rows (70%), "
+    f"{counts['validation']:,} validation rows (15%), and "
+    f"{counts['test']:,} untouched test rows (15%). "
+    "The final test model is fitted on training + validation data only."
+)
+
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Test MAE", f"{metrics['MAE']:,.0f} kWh")
+m2.metric("Test RMSE", f"{metrics['RMSE']:,.0f} kWh")
+m3.metric("Test MAPE", f"{metrics['MAPE']:.2f}%" if np.isfinite(metrics["MAPE"]) else "N/A")
+m4.metric("Test WAPE", f"{metrics['WAPE']:.2f}%" if np.isfinite(metrics["WAPE"]) else "N/A")
+m5.metric("Test R²", f"{metrics['R2']:.3f}" if np.isfinite(metrics["R2"]) else "N/A")
+
+st.caption(
+    f"Best validation MAE: {metrics['Validation_MAE']:,.0f} kWh · "
+    f"Selected XGBoost parameters: {trained['best_params']}"
+)
+st.info(
+    "This is a chronological one-day-ahead holdout evaluation. Actual historical rainfall "
+    "is supplied as an input for each test day; rainfall is not being forecast in this test. "
+    "Future forecasts use historical same-month median rainfall assumptions."
+)
+
+# Use the sidebar setting to control how many of the most recent test days are displayed.
+display_test = test_results.tail(validation_days).copy()
+if display_test.empty:
+    st.warning("There are no test rows available for the selected plant.")
 else:
-    validation_actual = actual_through_today.tail(validation_days).copy()
-    cutoff = validation_actual["Date"].min() - pd.Timedelta(days=1)
-    train_history = actual_through_today.loc[actual_through_today["Date"].le(cutoff)].copy()
-    if train_history.empty:
-        st.warning("No training history before the validation period.")
-    else:
-        validation_start = validation_actual["Date"].min()
-        validation_end = validation_actual["Date"].max()
-        validation_horizon = (validation_end - validation_start).days + 1
-        try:
-            with st.spinner("Replaying historical forecasts and calculating errors..."):
-                backtest_input = historical.loc[historical["Site"].ne(selected_site)].copy()
-                backtest_input = pd.concat([backtest_input, train_history], ignore_index=True)
-                predicted_history, _ = forecast_plant(backtest_input, selected_site,
-                                                       validation_start, validation_horizon)
-            daily = build_comparison(validation_actual, predicted_history)
-            paired = daily.loc[daily["Actual_Generation_kWh"].notna()].copy()
-            if paired.empty:
-                st.warning("No matching actual generation measurements were found for validation.")
-            else:
-                mae = paired["Absolute_Error_kWh"].mean()
-                rmse = np.sqrt(np.mean(paired["Generation_Difference_kWh"] ** 2))
-                nonzero = paired["Error_Percentage"].replace([np.inf,-np.inf], np.nan).dropna()
-                mape = nonzero.mean() if not nonzero.empty else np.nan
-                wape_den = paired["Actual_Generation_kWh"].abs().sum()
-                wape = 100 * paired["Absolute_Error_kWh"].sum() / wape_den if wape_den else np.nan
-                st.caption(f"Validation: {validation_start:%d %b %Y} to {validation_end:%d %b %Y} · "
-                           f"{len(paired)} matched days · recursive replay without actual generation from validation dates")
-                m1,m2,m3,m4 = st.columns(4)
-                m1.metric("Mean Absolute Error", f"{mae:,.0f} kWh")
-                m2.metric("RMSE", f"{rmse:,.0f} kWh")
-                m3.metric("Mean Daily Error", f"{mape:.2f}%" if np.isfinite(mape) else "N/A")
-                m4.metric("Weighted Error", f"{wape:.2f}%" if np.isfinite(wape) else "N/A")
-                st.caption("Error (%) = |Forecast − Actual| / |Actual| × 100. "
-                           "Zero-actual days have undefined daily percentage errors and are excluded from MAPE. "
-                           "Weighted error = sum of absolute errors / sum of absolute actual generation × 100.")
-                daily_tab, monthly_tab = st.tabs(["Daily Comparison", "Monthly Comparison"])
-                with daily_tab:
-                    comparison_chart(paired, "Actual_Generation_kWh", "Forecast_Generation_kWh",
-                                     "Daily Actual vs Forecast Generation", "Generation (kWh)")
-                    comparison_chart(paired, "Actual_Rainfall_mm", "Forecast_Rainfall_mm",
-                                     "Daily Actual vs Assumed Rainfall", "Rainfall (mm)")
-                    daily_view = paired[["Date","Actual_Generation_kWh","Forecast_Generation_kWh",
-                                         "Generation_Difference_kWh","Absolute_Error_kWh","Error_Percentage",
-                                         "Actual_Rainfall_mm","Forecast_Rainfall_mm","Rainfall_Difference_mm"]].copy()
-                    daily_view["Date"] = daily_view["Date"].dt.strftime("%d %b %Y")
-                    st.dataframe(daily_view, use_container_width=True, hide_index=True)
-                    st.download_button("Download Daily Comparison CSV", daily.to_csv(index=False).encode(),
-                                       file_name=f"{selected_site}_daily_validation.csv", mime="text/csv")
-                with monthly_tab:
-                    monthly = monthly_comparison(paired)
-                    comparison_chart(monthly, "Actual_Generation_kWh", "Forecast_Generation_kWh",
-                                     "Monthly Actual vs Forecast Generation (matched days)",
-                                     "Generation (kWh)", bars=True)
-                    comparison_chart(monthly, "Actual_Rainfall_mm", "Forecast_Rainfall_mm",
-                                     "Monthly Actual vs Assumed Rainfall (matched days)",
-                                     "Rainfall (mm)", bars=True)
-                    st.dataframe(monthly, use_container_width=True, hide_index=True)
-                    st.caption("Monthly comparisons cover only the matched validation days, not necessarily full calendar months. "
-                               "Monthly error uses the difference between monthly generation totals.")
-                    st.download_button("Download Monthly Comparison CSV", monthly.to_csv(index=False).encode(),
-                                       file_name=f"{selected_site}_monthly_validation.csv", mime="text/csv")
-        except Exception as exc:
-            st.error(f"Historical validation could not be completed: {exc}")
+    display_test["Month"] = display_test["Date"].dt.to_period("M").astype(str)
+    display_test["Generation_Difference_kWh"] = (
+        display_test["Forecast_Generation_kWh"] - display_test["Actual_Generation_kWh"]
+    )
+    display_test["Absolute_Error_kWh"] = display_test["Generation_Difference_kWh"].abs()
+    denom = display_test["Actual_Generation_kWh"].abs().replace(0, np.nan)
+    display_test["Error_Percentage"] = 100 * display_test["Absolute_Error_kWh"] / denom
+
+    daily_tab, monthly_tab = st.tabs(["Daily Comparison", "Monthly Comparison"])
+    with daily_tab:
+        comparison_chart(
+            display_test, "Actual_Generation_kWh", "Forecast_Generation_kWh",
+            "Daily Actual vs Forecast Generation", "Generation (kWh)"
+        )
+
+        # Rainfall is shown as one measured input series, not as a fake
+        # actual-vs-forecast comparison.
+        rain_fig = go.Figure()
+        rain_fig.add_trace(go.Bar(
+            x=display_test["Date"], y=display_test["Actual_Rainfall_mm"],
+            name="Measured rainfall", marker_color="#16866c"
+        ))
+        rain_fig.update_layout(
+            title="Daily Measured Rainfall Used by the Model",
+            height=330, margin=dict(l=10, r=10, t=55, b=10),
+            paper_bgcolor="white", plot_bgcolor="white",
+            yaxis_title="Rainfall (mm)", xaxis_title="", hovermode="x unified"
+        )
+        st.plotly_chart(rain_fig, use_container_width=True)
+
+        daily_view = display_test[[
+            "Date", "Actual_Generation_kWh", "Forecast_Generation_kWh",
+            "Generation_Difference_kWh", "Absolute_Error_kWh", "Error_Percentage",
+            "Actual_Rainfall_mm"
+        ]].copy()
+        daily_view["Date"] = daily_view["Date"].dt.strftime("%d %b %Y")
+        daily_view = daily_view.rename(columns={
+            "Actual_Generation_kWh": "Actual Generation (kWh)",
+            "Forecast_Generation_kWh": "Forecast Generation (kWh)",
+            "Generation_Difference_kWh": "Difference (kWh)",
+            "Absolute_Error_kWh": "Absolute Error (kWh)",
+            "Error_Percentage": "Error (%)",
+            "Actual_Rainfall_mm": "Measured Rainfall (mm)",
+        })
+        st.dataframe(daily_view, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Daily Comparison CSV",
+            display_test.to_csv(index=False).encode("utf-8"),
+            file_name=f"{selected_site}_daily_test_comparison.csv",
+            mime="text/csv",
+        )
+
+    with monthly_tab:
+        monthly = display_test.assign(
+            Month=display_test["Date"].dt.to_period("M").astype(str)
+        ).groupby("Month", as_index=False).agg(
+            Days_Compared=("Date", "count"),
+            Actual_Generation_kWh=("Actual_Generation_kWh", "sum"),
+            Forecast_Generation_kWh=("Forecast_Generation_kWh", "sum"),
+            Measured_Rainfall_mm=("Actual_Rainfall_mm", lambda x: x.sum(min_count=1)),
+        )
+        monthly["Generation_Difference_kWh"] = (
+            monthly["Forecast_Generation_kWh"] - monthly["Actual_Generation_kWh"]
+        )
+        monthly_denom = monthly["Actual_Generation_kWh"].abs().replace(0, np.nan)
+        monthly["Error_Percentage"] = (
+            100 * monthly["Generation_Difference_kWh"].abs() / monthly_denom
+        )
+
+        comparison_chart(
+            monthly, "Actual_Generation_kWh", "Forecast_Generation_kWh",
+            "Monthly Actual vs Forecast Generation (test days)", "Generation (kWh)", bars=True
+        )
+        rain_monthly_fig = go.Figure()
+        rain_monthly_fig.add_trace(go.Bar(
+            x=monthly["Month"], y=monthly["Measured_Rainfall_mm"],
+            name="Measured rainfall", marker_color="#16866c"
+        ))
+        rain_monthly_fig.update_layout(
+            title="Monthly Measured Rainfall (test days)",
+            height=330, margin=dict(l=10, r=10, t=55, b=10),
+            paper_bgcolor="white", plot_bgcolor="white",
+            yaxis_title="Rainfall (mm)", xaxis_title="", hovermode="x unified"
+        )
+        st.plotly_chart(rain_monthly_fig, use_container_width=True)
+        st.dataframe(monthly, use_container_width=True, hide_index=True)
+        st.caption(
+            "Monthly totals include only test-period days displayed above. "
+            "Monthly error is calculated from monthly generation totals."
+        )
+        st.download_button(
+            "Download Monthly Comparison CSV",
+            monthly.to_csv(index=False).encode("utf-8"),
+            file_name=f"{selected_site}_monthly_test_comparison.csv",
+            mime="text/csv",
+        )
 
 st.download_button("Download Upcoming Forecast CSV", future_comparison.to_csv(index=False).encode(),
                    file_name=f"{selected_site}_future_forecast.csv", mime="text/csv")
