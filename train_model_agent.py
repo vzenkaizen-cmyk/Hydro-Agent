@@ -35,9 +35,9 @@ FEATURES = [
 # Fast, highly accurate XGBoost settings
 TUNED_PARAMETERS = {
     "n_estimators": 1000,
-    "learning_rate": 0.03,        # Faster convergence
-    "max_depth": 5,
-    "min_child_weight": 2,
+    "learning_rate": 0.05,        # Faster convergence
+    "max_depth": 6,
+    "min_child_weight": 3,
     "subsample": 0.8,
     "colsample_bytree": 0.8,
     "reg_alpha": 0.01,
