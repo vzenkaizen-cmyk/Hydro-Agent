@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: hydro-intelligence-api
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r backend-requirements.txt
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: OPENWEATHER_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
