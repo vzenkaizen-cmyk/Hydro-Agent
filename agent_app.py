@@ -20,6 +20,14 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Respect the active Streamlit theme in Plotly charts.
+IS_DARK_THEME = st.get_option("theme.base") == "dark"
+PLOTLY_TEMPLATE = "plotly_dark" if IS_DARK_THEME else "plotly"
+
+# Respect the active Streamlit theme in Plotly charts.
+IS_DARK_THEME = st.get_option("theme.base") == "dark"
+PLOTLY_TEMPLATE = "plotly_dark" if IS_DARK_THEME else "plotly"
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "data" / "HydroGen_Model_Ready_Dataset.csv"
 MODEL_DIR = BASE_DIR / "models"
@@ -54,7 +62,7 @@ st.markdown(
     }
     [data-testid="stHeader"] {
         height: 2.8rem;
-        background: rgba(255,255,255,0.96);
+        background: var(--background-color, #ffffff);
     }
     [data-testid="stToolbar"] { right: 1rem; }
     h1, h2, h3, h4, p, label, [data-testid="stMetricLabel"] {
@@ -71,11 +79,31 @@ st.markdown(
     h2 { margin-top: 1.3rem !important; }
     h3 { margin-top: .7rem !important; }
     [data-testid="stMetric"] {
-        background: #ffffff;
-        border: 1px solid #e5e7eb;
+        background: var(--secondary-background-color, #ffffff);
+        color: var(--text-color, #262730);
+        border: 1px solid var(--border-color, #e5e7eb);
         border-radius: 12px;
         padding: 15px 17px;
         min-height: 112px;
+    }
+    [data-testid="stMetric"] [data-testid="stMetricLabel"],
+    [data-testid="stMetric"] [data-testid="stMetricValue"],
+    [data-testid="stMetric"] [data-testid="stMetricDelta"] {
+        color: var(--text-color, #262730) !important;
+    }
+    [data-theme="dark"] [data-testid="stMetric"],
+    body[data-theme="dark"] [data-testid="stMetric"] {
+        background: #262b36;
+        border-color: #454b58;
+        color: #f1f5f9;
+    }
+    [data-theme="dark"] [data-testid="stMetric"] [data-testid="stMetricLabel"],
+    [data-theme="dark"] [data-testid="stMetric"] [data-testid="stMetricValue"],
+    [data-theme="dark"] [data-testid="stMetric"] [data-testid="stMetricDelta"],
+    body[data-theme="dark"] [data-testid="stMetric"] [data-testid="stMetricLabel"],
+    body[data-theme="dark"] [data-testid="stMetric"] [data-testid="stMetricValue"],
+    body[data-theme="dark"] [data-testid="stMetric"] [data-testid="stMetricDelta"] {
+        color: #f1f5f9 !important;
     }
     [data-testid="stMetricLabel"] p {
         white-space: normal !important;
@@ -111,8 +139,15 @@ st.markdown(
         font-weight: 750;
         margin: 0;
     }
-    .subtle { color: #64748b; font-size: .9rem; }
-    .section-note { color: #64748b; font-size: .88rem; margin-top: -.35rem; }
+    .subtle { color: var(--text-color, #64748b); opacity: .72; font-size: .9rem; }
+    .section-note { color: var(--text-color, #64748b); opacity: .72; font-size: .88rem; margin-top: -.35rem; }
+    [data-theme="dark"] .subtle,
+    [data-theme="dark"] .section-note,
+    body[data-theme="dark"] .subtle,
+    body[data-theme="dark"] .section-note {
+        color: #cbd5e1;
+        opacity: .9;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -499,7 +534,7 @@ def comparison_chart(df: pd.DataFrame, actual_col: str, forecast_col: str,
             fig.add_trace(go.Scatter(x=x, y=df[col], name=label, mode="lines+markers",
                                      line=dict(color=color, width=2), marker=dict(size=4)))
     fig.update_layout(title=title, height=350, margin=dict(l=10, r=10, t=55, b=10),
-                      paper_bgcolor="white", plot_bgcolor="white", hovermode="x unified",
+                      template=PLOTLY_TEMPLATE, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", hovermode="x unified",
                       barmode="group", legend=dict(orientation="h", y=1.1),
                       yaxis_title=yaxis, xaxis_title="", yaxis=dict(rangemode="tozero"))
     st.plotly_chart(fig, use_container_width=True)
@@ -571,6 +606,8 @@ future_chart.add_trace(go.Scatter(x=forecast_df["Date"], y=forecast_df["Forecast
                                   name="Forecast generation", mode="lines+markers",
                                   line=dict(color="#1677b8", width=2)))
 future_chart.update_layout(height=350, margin=dict(l=10,r=10,t=25,b=10),
+                           template=PLOTLY_TEMPLATE, paper_bgcolor="rgba(0,0,0,0)",
+                           plot_bgcolor="rgba(0,0,0,0)",
                            yaxis_title="Generation (kWh)", xaxis_title="", hovermode="x unified")
 st.plotly_chart(future_chart, use_container_width=True)
 
@@ -655,7 +692,7 @@ else:
         rain_fig.update_layout(
             title="Daily Measured Rainfall Used by the Model",
             height=330, margin=dict(l=10, r=10, t=55, b=10),
-            paper_bgcolor="white", plot_bgcolor="white",
+            template=PLOTLY_TEMPLATE, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             yaxis_title="Rainfall (mm)", xaxis_title="", hovermode="x unified"
         )
         st.plotly_chart(rain_fig, use_container_width=True)
@@ -711,7 +748,7 @@ else:
         rain_monthly_fig.update_layout(
             title="Monthly Measured Rainfall (test days)",
             height=330, margin=dict(l=10, r=10, t=55, b=10),
-            paper_bgcolor="white", plot_bgcolor="white",
+            template=PLOTLY_TEMPLATE, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             yaxis_title="Rainfall (mm)", xaxis_title="", hovermode="x unified"
         )
         st.plotly_chart(rain_monthly_fig, use_container_width=True)
