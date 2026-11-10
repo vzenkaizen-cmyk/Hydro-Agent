@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import date
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
@@ -677,27 +678,38 @@ else:
 
     daily_tab, monthly_tab = st.tabs(["Daily Comparison", "Monthly Comparison"])
     with daily_tab:
+        month_options = sorted(display_test["Month"].unique())
+        selected_month = st.selectbox(
+            "Select Month for Daily Comparison",
+            month_options,
+            index=len(month_options) - 1,
+            key=f"{selected_site}_daily_comparison_month",
+        )
+        selected_month_data = display_test.loc[
+            display_test["Month"].eq(selected_month)
+        ].copy()
+
         comparison_chart(
-            display_test, "Actual_Generation_kWh", "Forecast_Generation_kWh",
-            "Daily Actual vs Forecast Generation", "Generation (kWh)"
+            selected_month_data, "Actual_Generation_kWh", "Forecast_Generation_kWh",
+            f"Daily Actual vs Forecast Generation - {selected_month}", "Generation (kWh)"
         )
 
         # Rainfall is shown as one measured input series, not as a fake
         # actual-vs-forecast comparison.
         rain_fig = go.Figure()
         rain_fig.add_trace(go.Bar(
-            x=display_test["Date"], y=display_test["Actual_Rainfall_mm"],
+            x=selected_month_data["Date"], y=selected_month_data["Actual_Rainfall_mm"],
             name="Measured rainfall", marker_color="#16866c"
         ))
         rain_fig.update_layout(
-            title="Daily Measured Rainfall Used by the Model",
+            title=f"Daily Measured Rainfall Used by the Model - {selected_month}",
             height=330, margin=dict(l=10, r=10, t=55, b=10),
             template=PLOTLY_TEMPLATE, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             yaxis_title="Rainfall (mm)", xaxis_title="", hovermode="x unified"
         )
         st.plotly_chart(rain_fig, use_container_width=True)
 
-        daily_view = display_test[[
+        daily_view = selected_month_data[[
             "Date", "Actual_Generation_kWh", "Forecast_Generation_kWh",
             "Generation_Difference_kWh", "Absolute_Error_kWh", "Error_Percentage",
             "Actual_Rainfall_mm"
@@ -714,9 +726,29 @@ else:
         st.dataframe(daily_view, use_container_width=True, hide_index=True)
         st.download_button(
             "Download Daily Comparison CSV",
-            display_test.to_csv(index=False).encode("utf-8"),
-            file_name=f"{selected_site}_daily_test_comparison.csv",
+            selected_month_data.to_csv(index=False).encode("utf-8"),
+            file_name=f"{selected_site}_{selected_month}_daily_comparison.csv",
             mime="text/csv",
+        )
+
+        excel_buffer = BytesIO()
+        month_summary = pd.DataFrame([{
+            "Month": selected_month,
+            "Days_Compared": len(selected_month_data),
+            "Actual_Generation_kWh": selected_month_data["Actual_Generation_kWh"].sum(),
+            "Forecast_Generation_kWh": selected_month_data["Forecast_Generation_kWh"].sum(),
+            "Measured_Rainfall_mm": selected_month_data["Actual_Rainfall_mm"].sum(min_count=1),
+            "Generation_Difference_kWh": selected_month_data["Generation_Difference_kWh"].sum(),
+        }])
+        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+            selected_month_data.to_excel(writer, sheet_name="Daily Comparison", index=False)
+            month_summary.to_excel(writer, sheet_name="Monthly Summary", index=False)
+
+        st.download_button(
+            "Download Selected Month Excel",
+            data=excel_buffer.getvalue(),
+            file_name=f"{selected_site}_{selected_month}_comparison.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
     with monthly_tab:
