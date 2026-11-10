@@ -158,27 +158,192 @@ st.markdown(
 # ============================================================
 # DATA AND MODEL LOADING
 # ============================================================
+# ============================================================
+# DATA AND MODEL LOADING
+# ============================================================
+OCTOBER_UPDATE_PATH = BASE_DIR / "data" / "hydro_october_2026_updates.csv"
+
+
+def _rebuild_model_features(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rebuild the model features from the merged daily actual records.
+    This ensures the newly imported October rows have the same lag/rolling
+    feature structure as the existing model dataset.
+    """
+    data = data.sort_values(["Site", "Date"]).reset_index(drop=True).copy()
+
+    for col in FEATURES:
+        if col not in data.columns:
+            data[col] = np.nan
+
+    rebuilt_groups = []
+    for _, group in data.groupby("Site", sort=False):
+        group = group.sort_values("Date").copy()
+        gen = pd.to_numeric(group["Generation_kWh"], errors="coerce")
+        rain = pd.to_numeric(group["Rainfall_Input_mm"], errors="coerce")
+
+        # Generation lags and rolling means use previous observations only.
+        for lag in (1, 7, 14, 30):
+            shifted = gen.shift(lag)
+            if len(gen):
+                first_value = gen.iloc[0]
+                shifted = shifted.fillna(first_value)
+            group[f"Lag{lag}_Generation_kWh"] = shifted
+
+        previous_gen = gen.shift(1)
+        group["Rolling7_Generation_kWh"] = previous_gen.rolling(
+            7, min_periods=1
+        ).mean()
+        group["Rolling30_Generation_kWh"] = previous_gen.rolling(
+            30, min_periods=1
+        ).mean()
+
+        # Rainfall lags follow the agent's observed-rainfall history logic:
+        # use the last available rainfall observations, not zero-filled gaps.
+        rain_values = rain.tolist()
+        lag_values = {1: [], 7: [], 14: [], 30: []}
+        rolling7_values, rolling30_values, coverage_values = [], [], []
+
+        for i in range(len(group)):
+            prior_rain = [v for v in rain_values[:i] if pd.notna(v)]
+            for lag in (1, 7, 14, 30):
+                if len(prior_rain) >= lag:
+                    lag_value = prior_rain[-lag]
+                elif prior_rain:
+                    lag_value = prior_rain[0]
+                else:
+                    lag_value = np.nan
+                lag_values[lag].append(lag_value)
+
+            rolling7_values.append(float(sum(prior_rain[-7:])) if prior_rain else 0.0)
+            rolling30_values.append(float(sum(prior_rain[-30:])) if prior_rain else 0.0)
+            last_30_rows = rain_values[max(0, i - 30):i]
+            coverage_values.append(
+                sum(pd.notna(v) for v in last_30_rows) / 30.0
+            )
+
+        for lag in (1, 7, 14, 30):
+            group[f"Lag{lag}_Rainfall_mm"] = lag_values[lag]
+        group["Rolling7_Rainfall_mm"] = rolling7_values
+        group["Rolling30_Rainfall_mm"] = rolling30_values
+        group["Rainfall_Coverage_30D"] = coverage_values
+
+        group["Month"] = group["Date"].dt.month.astype(float)
+        group["DayOfYear"] = group["Date"].dt.dayofyear.astype(float)
+        group["WeekOfYear"] = group["Date"].dt.isocalendar().week.astype(float)
+        group["Sin_DayOfYear"] = np.sin(
+            2 * np.pi * group["Date"].dt.dayofyear / 365.25
+        )
+        group["Cos_DayOfYear"] = np.cos(
+            2 * np.pi * group["Date"].dt.dayofyear / 365.25
+        )
+
+        rebuilt_groups.append(group)
+
+    if rebuilt_groups:
+        data = pd.concat(rebuilt_groups, ignore_index=True)
+
+    feature_values = data[FEATURES].replace([np.inf, -np.inf], np.nan)
+    data["Model_Ready"] = feature_values.notna().all(axis=1)
+    return data.sort_values(["Site", "Date"]).reset_index(drop=True)
+
+
 @st.cache_data(show_spinner="Loading historical generation and rainfall data...")
 def load_data() -> pd.DataFrame:
     if not DATA_PATH.exists():
         raise FileNotFoundError(f"Dataset not found: {DATA_PATH}")
+
     data = pd.read_csv(DATA_PATH)
     required = {"Site", "Date", "Generation_kWh", "Rainfall_Input_mm"}
     missing = required.difference(data.columns)
     if missing:
-        raise ValueError(f"Dataset is missing columns: {', '.join(sorted(missing))}")
+        raise ValueError(
+            f"Dataset is missing columns: {', '.join(sorted(missing))}"
+        )
 
-    data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
-    data["Generation_kWh"] = pd.to_numeric(data["Generation_kWh"], errors="coerce")
-    data["Rainfall_Input_mm"] = pd.to_numeric(data["Rainfall_Input_mm"], errors="coerce")
+    data["Site"] = data["Site"].astype(str).str.strip().str.upper()
+    data["Date"] = pd.to_datetime(data["Date"], errors="coerce").dt.normalize()
+    data["Generation_kWh"] = pd.to_numeric(
+        data["Generation_kWh"], errors="coerce"
+    )
+    data["Rainfall_Input_mm"] = pd.to_numeric(
+        data["Rainfall_Input_mm"], errors="coerce"
+    )
     data = data.dropna(subset=["Site", "Date", "Generation_kWh"]).copy()
-    data["Site"] = data["Site"].astype(str).str.strip()
-    data["Rainfall_Input_mm"] = data["Rainfall_Input_mm"].clip(lower=0)
+
+    # Apply the verified October 2026 daily readings on top of the existing
+    # historical dataset. The original dataset remains the historical base.
+    if OCTOBER_UPDATE_PATH.exists():
+        updates = pd.read_csv(OCTOBER_UPDATE_PATH)
+        updates["Site"] = updates["Site"].astype(str).str.strip().str.upper()
+        updates["Date"] = pd.to_datetime(
+            updates["Date"], errors="coerce"
+        ).dt.normalize()
+        updates["Generation_kWh"] = pd.to_numeric(
+            updates["Generation_kWh"], errors="coerce"
+        )
+        updates["Rainfall_Input_mm"] = pd.to_numeric(
+            updates["Rainfall_Input_mm"], errors="coerce"
+        )
+        updates["Plant_Factor"] = pd.to_numeric(
+            updates.get("Plant_Factor"), errors="coerce"
+        )
+        updates["Rainfall_Report_Available"] = (
+            updates["Rainfall_Report_Available"]
+            .astype(str).str.strip().str.lower()
+            .isin(["true", "1", "yes", "y"])
+        )
+
+        updates = updates.dropna(
+            subset=["Site", "Date", "Generation_kWh"]
+        ).drop_duplicates(["Site", "Date"], keep="last")
+
+        # Ensure optional columns exist before merging.
+        if "Plant_Factor" not in data.columns:
+            data["Plant_Factor"] = np.nan
+        if "Rainfall_Stations_Reported" not in data.columns:
+            data["Rainfall_Stations_Reported"] = np.nan
+
+        base = data.set_index(["Site", "Date"]).sort_index()
+        upd = updates.set_index(["Site", "Date"]).sort_index()
+        all_index = base.index.union(upd.index)
+        base = base.reindex(all_index)
+
+        # Generation and plant factor are replaced by the report values.
+        base.loc[upd.index, "Generation_kWh"] = upd["Generation_kWh"]
+        base.loc[upd.index, "Plant_Factor"] = upd["Plant_Factor"]
+
+        # For the six plants with supplied rainfall reports, apply the report
+        # exactly, including blank/missing gauge dates. For plants without a
+        # rainfall PDF, retain any rainfall already present in the base data.
+        report_sites = set(
+            updates.loc[
+                updates["Rainfall_Report_Available"], "Site"
+            ].unique()
+        )
+        report_index = upd.index[
+            upd.index.get_level_values("Site").isin(report_sites)
+        ]
+        base.loc[report_index, "Rainfall_Input_mm"] = upd.loc[
+            report_index, "Rainfall_Input_mm"
+        ]
+        base.loc[upd.index, "Rainfall_Stations_Reported"] = upd[
+            "Rainfall_Stations_Reported"
+        ]
+
+        data = base.reset_index()
+
+    data["Rainfall_Input_mm"] = pd.to_numeric(
+        data["Rainfall_Input_mm"], errors="coerce"
+    ).clip(lower=0)
     data = (
         data.sort_values(["Site", "Date"])
         .drop_duplicates(["Site", "Date"], keep="last")
         .reset_index(drop=True)
     )
+
+    # Recalculate lag and rolling features so October data is model-compatible.
+    data = _rebuild_model_features(data)
     return data
 
 
@@ -562,7 +727,12 @@ tomorrow = today + pd.Timedelta(days=1)
 # Train/evaluate chronologically, then use the production model for future forecasts.
 try:
     stat = DATA_PATH.stat()
-    data_signature = f"{stat.st_mtime_ns}-{stat.st_size}"
+    update_stat = OCTOBER_UPDATE_PATH.stat() if OCTOBER_UPDATE_PATH.exists() else None
+    update_signature = (
+        f"{update_stat.st_mtime_ns}-{update_stat.st_size}"
+        if update_stat else "no-october-update"
+    )
+    data_signature = f"{stat.st_mtime_ns}-{stat.st_size}-{update_signature}"
     with st.spinner("Training and validating the plant-specific XGBoost model..."):
         trained = train_site_model(selected_site, data_signature)
     with st.spinner("Calculating upcoming generation forecasts..."):
