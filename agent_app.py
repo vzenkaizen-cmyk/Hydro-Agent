@@ -158,10 +158,16 @@ st.markdown(
 # ============================================================
 # DATA AND MODEL LOADING
 # ============================================================
-# ============================================================
-# DATA AND MODEL LOADING
-# ============================================================
-OCTOBER_UPDATE_PATH = BASE_DIR / "data" / "hydro_october_2026_updates.csv"
+# Accept the filename currently uploaded to GitHub. Keep the older filename
+# as a fallback so existing deployments using the previous name still work.
+OCTOBER_UPDATE_CANDIDATES = [
+    BASE_DIR / "data" / "hydro_october_2026_data_fresh.csv",
+    BASE_DIR / "data" / "hydro_october_2026_updates.csv",
+]
+OCTOBER_UPDATE_PATH = next(
+    (path for path in OCTOBER_UPDATE_CANDIDATES if path.exists()),
+    OCTOBER_UPDATE_CANDIDATES[0],
+)
 
 
 def _rebuild_model_features(data: pd.DataFrame) -> pd.DataFrame:
@@ -262,8 +268,9 @@ def load_data() -> pd.DataFrame:
         )
 
     data["Site"] = data["Site"].astype(str).str.strip().str.upper()
-    # The October report labels this site ORK; historical data uses ORIC.
-    data["Site"] = data["Site"].replace({"ORIC": "ORK", "ORIK": "ORK"})
+    # The October report labels this plant ORK, while older historical rows
+    # use ORIC. Normalize both labels to ORK so they appear as one plant.
+    data["Site"] = data["Site"].replace({"ORIC": "ORK"})
     data["Date"] = pd.to_datetime(data["Date"], errors="coerce").dt.normalize()
     data["Generation_kWh"] = pd.to_numeric(
         data["Generation_kWh"], errors="coerce"
@@ -273,12 +280,13 @@ def load_data() -> pd.DataFrame:
     )
     data = data.dropna(subset=["Site", "Date", "Generation_kWh"]).copy()
 
-    # Apply the verified October 2026 daily readings on top of the existing
-    # historical dataset. The original dataset remains the historical base.
+    # Apply October 2026 daily readings on top of the existing historical
+    # dataset. The fresh GitHub filename is preferred; the older filename is
+    # supported as a fallback. The historical base file is never overwritten.
     if OCTOBER_UPDATE_PATH.exists():
         updates = pd.read_csv(OCTOBER_UPDATE_PATH)
         updates["Site"] = updates["Site"].astype(str).str.strip().str.upper()
-        updates["Site"] = updates["Site"].replace({"ORIC": "ORK", "ORIK": "ORK"})
+        updates["Site"] = updates["Site"].replace({"ORIC": "ORK"})
         updates["Date"] = pd.to_datetime(
             updates["Date"], errors="coerce"
         ).dt.normalize()
@@ -291,11 +299,16 @@ def load_data() -> pd.DataFrame:
         updates["Plant_Factor"] = pd.to_numeric(
             updates.get("Plant_Factor"), errors="coerce"
         )
-        updates["Rainfall_Report_Available"] = (
-            updates["Rainfall_Report_Available"]
-            .astype(str).str.strip().str.lower()
-            .isin(["true", "1", "yes", "y"])
-        )
+        if "Rainfall_Report_Available" in updates.columns:
+            updates["Rainfall_Report_Available"] = (
+                updates["Rainfall_Report_Available"]
+                .astype(str).str.strip().str.lower()
+                .isin(["true", "1", "yes", "y"])
+            )
+        else:
+            updates["Rainfall_Report_Available"] = False
+        if "Rainfall_Stations_Reported" not in updates.columns:
+            updates["Rainfall_Stations_Reported"] = np.nan
 
         updates = updates.dropna(
             subset=["Site", "Date", "Generation_kWh"]
@@ -316,7 +329,7 @@ def load_data() -> pd.DataFrame:
         base.loc[upd.index, "Generation_kWh"] = upd["Generation_kWh"]
         base.loc[upd.index, "Plant_Factor"] = upd["Plant_Factor"]
 
-        # For the seven plants with supplied rainfall reports, apply the report
+        # For the six plants with supplied rainfall reports, apply the report
         # exactly, including blank/missing gauge dates. For plants without a
         # rainfall PDF, retain any rainfall already present in the base data.
         report_sites = set(
@@ -660,6 +673,23 @@ try:
 except Exception as exc:
     st.error(f"Unable to load the forecasting dataset: {exc}")
     st.stop()
+
+# Confirm the October import in the live app so a missing/misnamed CSV is easy
+# to diagnose from Streamlit Cloud.
+october_rows = historical.loc[
+    historical["Date"].between("2026-10-01", "2026-10-31")
+].copy()
+if OCTOBER_UPDATE_PATH.exists() and not october_rows.empty:
+    october_sites = sorted(october_rows["Site"].dropna().unique().tolist())
+    st.success(
+        f"October 2026 data loaded: {len(october_rows):,} daily plant records "
+        f"across {len(october_sites)} plants ({', '.join(october_sites)})."
+    )
+else:
+    st.warning(
+        "October 2026 update file was not loaded. Expected file: "
+        "data/hydro_october_2026_data_fresh.csv. Check the filename and GitHub path."
+    )
 
 sites = sorted(historical["Site"].dropna().unique().tolist())
 if not sites:
