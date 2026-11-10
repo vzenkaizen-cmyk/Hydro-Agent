@@ -11,3 +11,4 @@ pyyaml
 requests
 mcp[cli]
 joblib
+openpyxl==3.1.5
