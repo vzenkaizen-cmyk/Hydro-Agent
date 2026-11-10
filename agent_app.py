@@ -526,7 +526,7 @@ def build_comparison(actual: pd.DataFrame, predicted: pd.DataFrame) -> pd.DataFr
 def comparison_chart(df: pd.DataFrame, actual_col: str, forecast_col: str,
                      title: str, yaxis: str, bars: bool = False):
     fig = go.Figure()
-    x = df["Month"] if "Month" in df.columns else df["Date"]
+    x = df["Date"] if "Date" in df.columns else df["Month"]
     for col, label, color in [(actual_col, "Actual", "#16866c"),
                               (forecast_col, "Forecast", "#1677b8")]:
         if bars:
@@ -663,56 +663,155 @@ st.info(
     "Future forecasts use historical same-month median rainfall assumptions."
 )
 
-# Use the sidebar setting to control how many of the most recent test days are displayed.
-display_test = test_results.tail(validation_days).copy()
-if display_test.empty:
-    st.warning("There are no test rows available for the selected plant.")
-else:
-    display_test["Month"] = display_test["Date"].dt.to_period("M").astype(str)
-    display_test["Generation_Difference_kWh"] = (
-        display_test["Forecast_Generation_kWh"] - display_test["Actual_Generation_kWh"]
-    )
-    display_test["Absolute_Error_kWh"] = display_test["Generation_Difference_kWh"].abs()
-    denom = display_test["Actual_Generation_kWh"].abs().replace(0, np.nan)
-    display_test["Error_Percentage"] = 100 * display_test["Absolute_Error_kWh"] / denom
+# ============================================================
+# FULL HISTORICAL DAILY / MONTHLY COMPARISON
+# ============================================================
+# Show every month available in the source dataset. Forecast values are
+# populated only for the untouched chronological test period, so earlier
+# historical rows are not misleadingly presented as out-of-sample forecasts.
+st.subheader("Historical Actual vs Forecast Comparison")
 
+test_results = trained["test_results"].copy()
+test_results["Date"] = pd.to_datetime(test_results["Date"]).dt.normalize()
+metrics = trained["metrics"]
+counts = trained["counts"]
+
+st.caption(
+    f"Chronological split: {counts['train']:,} training rows (70%), "
+    f"{counts['validation']:,} validation rows (15%), and "
+    f"{counts['test']:,} untouched test rows (15%). "
+    "The final test model is fitted on training + validation data only."
+)
+
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Test MAE", f"{metrics['MAE']:,.0f} kWh")
+m2.metric("Test RMSE", f"{metrics['RMSE']:,.0f} kWh")
+m3.metric("Test MAPE", f"{metrics['MAPE']:.2f}%" if np.isfinite(metrics["MAPE"]) else "N/A")
+m4.metric("Test WAPE", f"{metrics['WAPE']:.2f}%" if np.isfinite(metrics["WAPE"]) else "N/A")
+m5.metric("Test R²", f"{metrics['R2']:.3f}" if np.isfinite(metrics["R2"]) else "N/A")
+
+st.caption(
+    f"Best validation MAE: {metrics['Validation_MAE']:,.0f} kWh · "
+    f"Selected XGBoost parameters: {trained['best_params']}"
+)
+st.info(
+    "Historical actual generation and measured rainfall are shown for every date "
+    "available in the selected plant's source dataset. Forecast-versus-actual errors "
+    "are shown only for the untouched chronological test dates. Historical rainfall "
+    "is measured input data; it is not a separately predicted rainfall forecast."
+)
+
+# Start with the complete historical record, then attach only genuine test forecasts.
+historical_comparison = site_history[
+    ["Date", "Generation_kWh", "Rainfall_Input_mm"]
+].copy()
+historical_comparison["Date"] = pd.to_datetime(
+    historical_comparison["Date"]
+).dt.normalize()
+historical_comparison = historical_comparison.rename(columns={
+    "Generation_kWh": "Actual_Generation_kWh",
+    "Rainfall_Input_mm": "Actual_Rainfall_mm",
+})
+
+forecast_columns = [
+    "Date", "Forecast_Generation_kWh"
+]
+historical_comparison = historical_comparison.merge(
+    test_results[forecast_columns].drop_duplicates("Date"),
+    on="Date",
+    how="left",
+    validate="one_to_one",
+)
+historical_comparison["Generation_Difference_kWh"] = (
+    historical_comparison["Forecast_Generation_kWh"]
+    - historical_comparison["Actual_Generation_kWh"]
+)
+historical_comparison["Absolute_Error_kWh"] = (
+    historical_comparison["Generation_Difference_kWh"].abs()
+)
+actual_denominator = historical_comparison["Actual_Generation_kWh"].abs().replace(0, np.nan)
+historical_comparison["Error_Percentage"] = (
+    100 * historical_comparison["Absolute_Error_kWh"] / actual_denominator
+)
+historical_comparison["Month"] = (
+    historical_comparison["Date"].dt.to_period("M").astype(str)
+)
+
+if historical_comparison.empty:
+    st.warning("There are no historical records available for the selected plant.")
+else:
     daily_tab, monthly_tab = st.tabs(["Daily Comparison", "Monthly Comparison"])
+
     with daily_tab:
-        month_options = sorted(display_test["Month"].unique())
+        month_options = sorted(historical_comparison["Month"].dropna().unique().tolist())
+        # Prefer the most recent month that has genuine test forecasts.
+        forecast_months = historical_comparison.loc[
+            historical_comparison["Forecast_Generation_kWh"].notna(), "Month"
+        ].dropna().unique().tolist()
+        default_month = forecast_months[-1] if forecast_months else month_options[-1]
+        default_index = month_options.index(default_month)
+
         selected_month = st.selectbox(
             "Select Month for Daily Comparison",
             month_options,
-            index=len(month_options) - 1,
+            index=default_index,
             key=f"{selected_site}_daily_comparison_month",
         )
-        selected_month_data = display_test.loc[
-            display_test["Month"].eq(selected_month)
-        ].copy()
+        selected_month_data = historical_comparison.loc[
+            historical_comparison["Month"].eq(selected_month)
+        ].copy().sort_values("Date")
+
+        forecast_days_in_month = int(
+            selected_month_data["Forecast_Generation_kWh"].notna().sum()
+        )
+        if forecast_days_in_month == 0:
+            st.warning(
+                "No out-of-sample forecast predictions are available for this month. "
+                "The table and rainfall chart show the actual records available in the dataset."
+            )
+        else:
+            st.caption(
+                f"{forecast_days_in_month} day(s) in this month have out-of-sample "
+                "forecast predictions available for a fair actual-versus-forecast comparison."
+            )
 
         comparison_chart(
-            selected_month_data, "Actual_Generation_kWh", "Forecast_Generation_kWh",
-            f"Daily Actual vs Forecast Generation - {selected_month}", "Generation (kWh)"
+            selected_month_data,
+            "Actual_Generation_kWh",
+            "Forecast_Generation_kWh",
+            f"Daily Actual vs Forecast Generation - {selected_month}",
+            "Generation (kWh)",
         )
 
-        # Rainfall is shown as one measured input series, not as a fake
-        # actual-vs-forecast comparison.
+        # Historical rainfall is measured rainfall, not a rainfall forecast.
         rain_fig = go.Figure()
         rain_fig.add_trace(go.Bar(
-            x=selected_month_data["Date"], y=selected_month_data["Actual_Rainfall_mm"],
-            name="Measured rainfall", marker_color="#16866c"
+            x=selected_month_data["Date"],
+            y=selected_month_data["Actual_Rainfall_mm"],
+            name="Measured rainfall",
+            marker_color="#16866c",
         ))
         rain_fig.update_layout(
-            title=f"Daily Measured Rainfall Used by the Model - {selected_month}",
-            height=330, margin=dict(l=10, r=10, t=55, b=10),
-            template=PLOTLY_TEMPLATE, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            yaxis_title="Rainfall (mm)", xaxis_title="", hovermode="x unified"
+            title=f"Daily Measured Rainfall - {selected_month}",
+            height=330,
+            margin=dict(l=10, r=10, t=55, b=10),
+            template=PLOTLY_TEMPLATE,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            yaxis_title="Rainfall (mm)",
+            xaxis_title="",
+            hovermode="x unified",
         )
         st.plotly_chart(rain_fig, use_container_width=True)
 
         daily_view = selected_month_data[[
-            "Date", "Actual_Generation_kWh", "Forecast_Generation_kWh",
-            "Generation_Difference_kWh", "Absolute_Error_kWh", "Error_Percentage",
-            "Actual_Rainfall_mm"
+            "Date",
+            "Actual_Generation_kWh",
+            "Forecast_Generation_kWh",
+            "Generation_Difference_kWh",
+            "Absolute_Error_kWh",
+            "Error_Percentage",
+            "Actual_Rainfall_mm",
         ]].copy()
         daily_view["Date"] = daily_view["Date"].dt.strftime("%d %b %Y")
         daily_view = daily_view.rename(columns={
@@ -724,6 +823,7 @@ else:
             "Actual_Rainfall_mm": "Measured Rainfall (mm)",
         })
         st.dataframe(daily_view, use_container_width=True, hide_index=True)
+
         st.download_button(
             "Download Daily Comparison CSV",
             selected_month_data.to_csv(index=False).encode("utf-8"),
@@ -732,17 +832,32 @@ else:
         )
 
         excel_buffer = BytesIO()
+        # Monthly totals for the workbook: forecast totals and matched actual
+        # totals are calculated over exactly the same test dates.
+        matched_month = selected_month_data.dropna(
+            subset=["Forecast_Generation_kWh", "Actual_Generation_kWh"]
+        )
         month_summary = pd.DataFrame([{
+            "Plant": selected_site,
             "Month": selected_month,
-            "Days_Compared": len(selected_month_data),
-            "Actual_Generation_kWh": selected_month_data["Actual_Generation_kWh"].sum(),
-            "Forecast_Generation_kWh": selected_month_data["Forecast_Generation_kWh"].sum(),
-            "Measured_Rainfall_mm": selected_month_data["Actual_Rainfall_mm"].sum(min_count=1),
-            "Generation_Difference_kWh": selected_month_data["Generation_Difference_kWh"].sum(),
+            "Historical_Actual_Days": len(selected_month_data),
+            "Out_of_Sample_Forecast_Days": len(matched_month),
+            "Actual_Generation_All_Available_Days_kWh":
+                selected_month_data["Actual_Generation_kWh"].sum(min_count=1),
+            "Actual_Generation_On_Forecast_Days_kWh":
+                matched_month["Actual_Generation_kWh"].sum(min_count=1),
+            "Forecast_Generation_On_Matched_Days_kWh":
+                matched_month["Forecast_Generation_kWh"].sum(min_count=1),
+            "Measured_Rainfall_mm":
+                selected_month_data["Actual_Rainfall_mm"].sum(min_count=1),
         }])
         with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            selected_month_data.to_excel(writer, sheet_name="Daily Comparison", index=False)
-            month_summary.to_excel(writer, sheet_name="Monthly Summary", index=False)
+            selected_month_data.to_excel(
+                writer, sheet_name="Daily Comparison", index=False
+            )
+            month_summary.to_excel(
+                writer, sheet_name="Monthly Summary", index=False
+            )
 
         st.download_button(
             "Download Selected Month Excel",
@@ -752,47 +867,89 @@ else:
         )
 
     with monthly_tab:
-        monthly = display_test.assign(
-            Month=display_test["Date"].dt.to_period("M").astype(str)
-        ).groupby("Month", as_index=False).agg(
-            Days_Compared=("Date", "count"),
-            Actual_Generation_kWh=("Actual_Generation_kWh", "sum"),
-            Forecast_Generation_kWh=("Forecast_Generation_kWh", "sum"),
+        monthly = historical_comparison.groupby("Month", as_index=False).agg(
+            Historical_Actual_Days=("Date", "count"),
+            Actual_Generation_All_Days_kWh=("Actual_Generation_kWh", "sum"),
             Measured_Rainfall_mm=("Actual_Rainfall_mm", lambda x: x.sum(min_count=1)),
-        )
-        monthly["Generation_Difference_kWh"] = (
-            monthly["Forecast_Generation_kWh"] - monthly["Actual_Generation_kWh"]
-        )
-        monthly_denom = monthly["Actual_Generation_kWh"].abs().replace(0, np.nan)
-        monthly["Error_Percentage"] = (
-            100 * monthly["Generation_Difference_kWh"].abs() / monthly_denom
+            Forecast_Days=("Forecast_Generation_kWh", "count"),
         )
 
-        comparison_chart(
-            monthly, "Actual_Generation_kWh", "Forecast_Generation_kWh",
-            "Monthly Actual vs Forecast Generation (test days)", "Generation (kWh)", bars=True
+        matched_monthly = historical_comparison.dropna(
+            subset=["Forecast_Generation_kWh", "Actual_Generation_kWh"]
+        ).groupby("Month", as_index=False).agg(
+            Actual_Generation_On_Forecast_Days_kWh=("Actual_Generation_kWh", "sum"),
+            Forecast_Generation_On_Matched_Days_kWh=("Forecast_Generation_kWh", "sum"),
         )
+        monthly = monthly.merge(matched_monthly, on="Month", how="left")
+        monthly["Generation_Difference_kWh"] = (
+            monthly["Forecast_Generation_On_Matched_Days_kWh"]
+            - monthly["Actual_Generation_On_Forecast_Days_kWh"]
+        )
+        monthly_denominator = (
+            monthly["Actual_Generation_On_Forecast_Days_kWh"].abs().replace(0, np.nan)
+        )
+        monthly["Error_Percentage"] = (
+            100 * monthly["Generation_Difference_kWh"].abs() / monthly_denominator
+        )
+
+        monthly_chart = go.Figure()
+        monthly_chart.add_trace(go.Bar(
+            x=monthly["Month"],
+            y=monthly["Actual_Generation_On_Forecast_Days_kWh"],
+            name="Actual generation (matched test days)",
+            marker_color="#16866c",
+        ))
+        monthly_chart.add_trace(go.Bar(
+            x=monthly["Month"],
+            y=monthly["Forecast_Generation_On_Matched_Days_kWh"],
+            name="Forecast generation (matched test days)",
+            marker_color="#1677b8",
+        ))
+        monthly_chart.update_layout(
+            title="Monthly Actual vs Forecast Generation (matched test days)",
+            height=350,
+            margin=dict(l=10, r=10, t=55, b=10),
+            template=PLOTLY_TEMPLATE,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            hovermode="x unified",
+            barmode="group",
+            legend=dict(orientation="h", y=1.1),
+            yaxis_title="Generation (kWh)",
+            xaxis_title="Month",
+            yaxis=dict(rangemode="tozero"),
+        )
+        st.plotly_chart(monthly_chart, use_container_width=True)
+
         rain_monthly_fig = go.Figure()
         rain_monthly_fig.add_trace(go.Bar(
-            x=monthly["Month"], y=monthly["Measured_Rainfall_mm"],
-            name="Measured rainfall", marker_color="#16866c"
+            x=monthly["Month"],
+            y=monthly["Measured_Rainfall_mm"],
+            name="Measured rainfall",
+            marker_color="#16866c",
         ))
         rain_monthly_fig.update_layout(
-            title="Monthly Measured Rainfall (test days)",
-            height=330, margin=dict(l=10, r=10, t=55, b=10),
-            template=PLOTLY_TEMPLATE, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            yaxis_title="Rainfall (mm)", xaxis_title="", hovermode="x unified"
+            title="Monthly Measured Rainfall (all available historical days)",
+            height=330,
+            margin=dict(l=10, r=10, t=55, b=10),
+            template=PLOTLY_TEMPLATE,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            yaxis_title="Rainfall (mm)",
+            xaxis_title="Month",
+            hovermode="x unified",
         )
         st.plotly_chart(rain_monthly_fig, use_container_width=True)
         st.dataframe(monthly, use_container_width=True, hide_index=True)
         st.caption(
-            "Monthly totals include only test-period days displayed above. "
-            "Monthly error is calculated from monthly generation totals."
+            "Historical actual and rainfall totals include all available records. "
+            "Forecast totals and forecast errors use only matched out-of-sample test days; "
+            "months without test predictions therefore have blank forecast values."
         )
         st.download_button(
             "Download Monthly Comparison CSV",
             monthly.to_csv(index=False).encode("utf-8"),
-            file_name=f"{selected_site}_monthly_test_comparison.csv",
+            file_name=f"{selected_site}_monthly_historical_comparison.csv",
             mime="text/csv",
         )
 
